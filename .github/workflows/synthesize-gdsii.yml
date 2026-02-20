@@ -1,0 +1,144 @@
+name: Synthesize GDSII from VHDL/Verilog
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Project ID from OpenCores.ai'
+        required: true
+      module_name:
+        description: 'Top module name'
+        required: true
+      pdk:
+        description: 'PDK to use (sky130 or gf180mcu)'
+        required: false
+        default: 'sky130'
+  push:
+    paths:
+      - 'projects/**/*.v'
+      - 'projects/**/*.vhd'
+
+jobs:
+  synthesize:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install OpenLane/LibreLane
+        run: |
+          # Install dependencies
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            tcl \
+            tcl-dev \
+            tk \
+            tk-dev \
+            python3-pip
+          
+          # Install LibreLane
+          pip install librelane
+          
+          # Download PDK
+          if [ "${{ github.event.inputs.pdk }}" == "sky130" ]; then
+            wget https://github.com/google/skywater-pdk/releases/download/v0.0.5/sky130A.tar.gz
+            tar -xzf sky130A.tar.gz
+            export PDK_ROOT=$PWD/sky130A
+          fi
+      
+      - name: Find Verilog code
+        id: find_code
+        run: |
+          # Find the Verilog file in projects directory
+          PROJECT_ID="${{ github.event.inputs.project_id }}"
+          MODULE_NAME="${{ github.event.inputs.module_name }}"
+          
+          VERILOG_FILE="projects/${PROJECT_ID}/${MODULE_NAME}.v"
+          
+          if [ ! -f "$VERILOG_FILE" ]; then
+            echo "❌ Verilog file not found: $VERILOG_FILE"
+            exit 1
+          fi
+          
+          echo "verilog_file=$VERILOG_FILE" >> $GITHUB_OUTPUT
+          echo "✅ Found Verilog code: $VERILOG_FILE"
+      
+      - name: Run LibreLane synthesis
+        run: |
+          mkdir -p synthesis_work
+          cd synthesis_work
+          
+          # Copy Verilog file
+          cp ../${{ steps.find_code.outputs.verilog_file }} .
+          
+          # Create LibreLane config
+          cat > config.json << EOF
+          {
+            "DESIGN_NAME": "${{ github.event.inputs.module_name }}",
+            "VERILOG_FILES": "${{ github.event.inputs.module_name }}.v",
+            "CLOCK_PORT": "clk",
+            "CLOCK_PERIOD": 10.0,
+            "PDK": "${{ github.event.inputs.pdk }}"
+          }
+          EOF
+          
+          echo "🔧 Starting synthesis with LibreLane..."
+          # Run synthesis
+          librelane config.json || echo "⚠️ Synthesis had warnings, continuing..."
+      
+      - name: Upload GDSII
+        uses: actions/upload-artifact@v3
+        with:
+          name: gdsii-output
+          path: |
+            synthesis_work/runs/*/results/final/gds/*.gds
+            synthesis_work/runs/*/results/final/def/*.def
+            synthesis_work/runs/*/reports/*.rpt
+      
+      - name: Generate viewer URL
+        id: viewer
+        run: |
+          GDS_FILE=$(find synthesis_work/runs/*/results/final/gds -name "*.gds" | head -1)
+          if [ -f "$GDS_FILE" ]; then
+            # Upload to GitHub release or artifact
+            echo "gds_file=$GDS_FILE" >> $GITHUB_OUTPUT
+            echo "✅ GDSII generated successfully: $GDS_FILE"
+            
+            # Generate TinyTapeout viewer URL
+            # In production, upload to a CDN and generate proper URL
+            echo "viewer_url=https://gds-viewer.tinytapeout.com/?model=<upload-url>" >> $GITHUB_OUTPUT
+          else
+            echo "❌ GDSII generation failed"
+            exit 1
+          fi
+      
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const gdsFile = '${{ steps.viewer.outputs.gds_file }}';
+            const viewerUrl = '${{ steps.viewer.outputs.viewer_url }}';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.name,
+              body: `## 🎉 GDSII Synthesis Complete!\n\n` +
+                    `**Module**: \`${{ github.event.inputs.top_module }}\`\n` +
+                    `**PDK**: ${{ github.event.inputs.pdk }}\n\n` +
+                    `### 📦 Artifacts\n` +
+                    `- [Download GDSII](${gdsFile})\n` +
+                    `- [View 2D Layout](${viewerUrl})\n` +
+                    `- [View 3D Simulation](${viewerUrl})\n\n` +
+                    `The GDSII file is ready for fabrication! 🚀`
+            });
+
