@@ -1,0 +1,159 @@
+name: Generate GDSII
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Project ID from OpenCores.ai'
+        required: true
+      module_name:
+        description: 'Top module name'
+        required: true
+  push:
+    paths:
+      - 'projects/**/*.v'
+      - 'projects/**/*.vhd'
+
+jobs:
+  gds:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Extract project information
+        id: info
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            PROJECT_ID="${{ github.event.inputs.project_id }}"
+            MODULE_NAME="${{ github.event.inputs.module_name }}"
+          else
+            # Extract from push
+            CHANGED=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep -E 'projects/.*/.*\.v$' | head -1)
+            PROJECT_ID=$(echo "$CHANGED" | cut -d'/' -f2)
+            MODULE_NAME=$(basename "$CHANGED" .v)
+          fi
+          
+          echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
+          echo "module_name=$MODULE_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Project: $PROJECT_ID, Module: $MODULE_NAME"
+
+      - name: Setup TinyTapeout structure
+        run: |
+          PROJECT_ID="${{ steps.info.outputs.project_id }}"
+          MODULE_NAME="${{ steps.info.outputs.module_name }}"
+          
+          echo "📦 Setting up TinyTapeout-compatible structure..."
+          
+          # Create src directory for TinyTapeout
+          mkdir -p src
+          
+          # Copy HDL file to src/
+          if [ -f "projects/${PROJECT_ID}/${MODULE_NAME}.v" ]; then
+            cp "projects/${PROJECT_ID}/${MODULE_NAME}.v" "src/${MODULE_NAME}.v"
+            echo "✅ Copied Verilog: projects/${PROJECT_ID}/${MODULE_NAME}.v → src/${MODULE_NAME}.v"
+          else
+            echo "❌ File not found: projects/${PROJECT_ID}/${MODULE_NAME}.v"
+            exit 1
+          fi
+          
+          # Create info.yaml (required by TinyTapeout)
+          cat > info.yaml << 'YAML_EOF'
+project:
+  title: "OpenCores Design"
+  author: "OpenCores.ai User"
+  description: "Auto-generated from OpenCores.ai"
+
+documentation:
+  author: "OpenCores.ai"
+  title: "Auto-generated Design"
+  language: "Verilog"
+  description: "Synthesized using TinyTapeout OpenLane2 flow"
+
+pinout:
+  ui[0]: "Input 0"
+  ui[1]: "Input 1"
+  ui[2]: "Input 2"
+  ui[3]: "Input 3"
+  ui[4]: "Input 4"
+  ui[5]: "Input 5"
+  ui[6]: "Input 6"
+  ui[7]: "Input 7"
+  uo[0]: "Output 0"
+  uo[1]: "Output 1"
+  uo[2]: "Output 2"
+  uo[3]: "Output 3"
+  uo[4]: "Output 4"
+  uo[5]: "Output 5"
+  uo[6]: "Output 6"
+  uo[7]: "Output 7"
+YAML_EOF
+          
+          # Create config.json for OpenLane
+          cat > config.json << EOF
+{
+  "DESIGN_NAME": "${MODULE_NAME}",
+  "VERILOG_FILES": "dir::src/${MODULE_NAME}.v",
+  "CLOCK_PORT": "clk",
+  "CLOCK_PERIOD": 20,
+  "PL_TARGET_DENSITY": 0.6,
+  "FP_SIZING": "absolute",
+  "DIE_AREA": "0 0 150 150",
+  "RUN_LINTER": 0,
+  "RUN_CTS": 1
+}
+EOF
+          
+          echo "✅ TinyTapeout structure ready"
+          ls -la
+
+      - name: Build GDS with TinyTapeout
+        uses: TinyTapeout/tt-gds-action@tt10
+        
+      - name: Verify GDS generation
+        id: verify
+        run: |
+          echo "🔍 Looking for generated GDS files..."
+          
+          # TinyTapeout creates runs/wokwi/results/final/gds/
+          if [ -d "runs" ]; then
+            find runs -name "*.gds" -type f -exec ls -lh {} \;
+            
+            GDS_FILE=$(find runs -name "*.gds" -type f | head -1)
+            
+            if [ -n "$GDS_FILE" ] && [ -f "$GDS_FILE" ]; then
+              echo "gds_path=$GDS_FILE" >> $GITHUB_OUTPUT
+              SIZE=$(stat -f%z "$GDS_FILE" 2>/dev/null || stat -c%s "$GDS_FILE")
+              echo "gds_size=$SIZE" >> $GITHUB_OUTPUT
+              echo "✅ GDS found: $GDS_FILE ($SIZE bytes)"
+            else
+              echo "❌ No GDS file generated!"
+              exit 1
+            fi
+          else
+            echo "❌ No runs directory found!"
+            exit 1
+          fi
+
+      - name: Upload GDSII artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdsii-${{ steps.info.outputs.module_name }}
+          path: |
+            runs/**/results/final/gds/*.gds
+            runs/**/results/final/def/*.def
+            runs/**/results/final/lef/*.lef
+            runs/**/reports/**/*.rpt
+          if-no-files-found: error
+
+      - name: Success summary
+        run: |
+          echo "🎉 GDSII Generation Complete!"
+          echo "================================"
+          echo "Module: ${{ steps.info.outputs.module_name }}"
+          echo "GDS File: ${{ steps.verify.outputs.gds_path }}"
+          echo "Size: ${{ steps.verify.outputs.gds_size }} bytes"
+          echo "================================"
+          echo "✅ Artifact uploaded successfully"
