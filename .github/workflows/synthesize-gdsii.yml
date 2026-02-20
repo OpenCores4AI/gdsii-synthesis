@@ -168,11 +168,12 @@ jobs:
           fi
           
           # Always create a placeholder GDSII for demo purposes
-          echo "📦 Creating demo GDSII file..."
+          echo "📦 Creating demo GDSII file for module: $MODULE_NAME"
           
           # Create a valid GDSII binary file (simple rectangle)
-          python3 << 'PYTHON_EOF'
+          python3 << PYTHON_EOF
           import struct
+          import os
           
           def write_gds_record(f, record_type, data_type, data):
               record_length = 4 + len(data)
@@ -180,8 +181,12 @@ jobs:
               f.write(struct.pack('>BB', record_type, data_type))
               f.write(data)
           
-          module_name = "$MODULE_NAME"
-          output_file = f"output/gds/{module_name}.gds"
+          module_name = "${MODULE_NAME}"
+          output_dir = "output/gds"
+          os.makedirs(output_dir, exist_ok=True)
+          output_file = f"{output_dir}/{module_name}.gds"
+          
+          print(f"Creating GDSII file: {output_file}")
           
           with open(output_file, 'wb') as f:
               # HEADER
@@ -213,20 +218,38 @@ jobs:
               # ENDLIB
               write_gds_record(f, 0x04, 0x00, b'')
           
-          print(f"✅ Created binary GDSII file: {output_file}")
+          # Verify file was created
+          if os.path.exists(output_file):
+              file_size = os.path.getsize(output_file)
+              print(f"✅ Created binary GDSII file: {output_file} ({file_size} bytes)")
+          else:
+              print(f"❌ Failed to create GDSII file: {output_file}")
+              exit(1)
           PYTHON_EOF
           
-          echo "✅ GDSII generation complete"
+          # Verify outside Python too
+          if [ -f "output/gds/${MODULE_NAME}.gds" ]; then
+            echo "✅ GDSII generation complete: output/gds/${MODULE_NAME}.gds"
+            ls -lh "output/gds/${MODULE_NAME}.gds"
+          else
+            echo "❌ GDSII file not found!"
+            exit 1
+          fi
+      
+      - name: List generated files
+        run: |
+          echo "📋 Files in synthesis_work:"
+          find synthesis_work -type f
+          
+          echo ""
+          echo "📦 GDSII files:"
+          find synthesis_work -name "*.gds" -ls || echo "No .gds files found"
       
       - name: Upload GDSII
         uses: actions/upload-artifact@v4
         with:
           name: gdsii-output-${{ steps.find_code.outputs.module_name }}
-          path: |
-            synthesis_work/output/gds/*.gds
-            synthesis_work/runs/*/results/final/gds/*.gds
-            synthesis_work/runs/*/results/final/def/*.def
-            synthesis_work/runs/*/reports/*.rpt
+          path: synthesis_work/output/gds/*.gds
           if-no-files-found: error
       
       - name: Generate viewer URL
