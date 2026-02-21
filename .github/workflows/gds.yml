@@ -60,36 +60,36 @@ jobs:
           fi
           
           # Create info.yaml (required by TinyTapeout)
-          cat > info.yaml << 'YAML_EOF'
-project:
-  title: "OpenCores Design"
-  author: "OpenCores.ai User"
-  description: "Auto-generated from OpenCores.ai"
-
-documentation:
-  author: "OpenCores.ai"
-  title: "Auto-generated Design"
-  language: "Verilog"
-  description: "Synthesized using TinyTapeout OpenLane2 flow"
-
-pinout:
-  ui[0]: "Input 0"
-  ui[1]: "Input 1"
-  ui[2]: "Input 2"
-  ui[3]: "Input 3"
-  ui[4]: "Input 4"
-  ui[5]: "Input 5"
-  ui[6]: "Input 6"
-  ui[7]: "Input 7"
-  uo[0]: "Output 0"
-  uo[1]: "Output 1"
-  uo[2]: "Output 2"
-  uo[3]: "Output 3"
-  uo[4]: "Output 4"
-  uo[5]: "Output 5"
-  uo[6]: "Output 6"
-  uo[7]: "Output 7"
-YAML_EOF
+          cat > info.yaml << 'EOF'
+          project:
+            title: "OpenCores Design"
+            author: "OpenCores.ai User"
+            description: "Auto-generated from OpenCores.ai"
+          
+          documentation:
+            author: "OpenCores.ai"
+            title: "Auto-generated Design"
+            language: "Verilog"
+            description: "Synthesized using TinyTapeout OpenLane2 flow"
+          
+          pinout:
+            ui[0]: "Input 0"
+            ui[1]: "Input 1"
+            ui[2]: "Input 2"
+            ui[3]: "Input 3"
+            ui[4]: "Input 4"
+            ui[5]: "Input 5"
+            ui[6]: "Input 6"
+            ui[7]: "Input 7"
+            uo[0]: "Output 0"
+            uo[1]: "Output 1"
+            uo[2]: "Output 2"
+            uo[3]: "Output 3"
+            uo[4]: "Output 4"
+            uo[5]: "Output 5"
+            uo[6]: "Output 6"
+            uo[7]: "Output 7"
+          EOF
           
           # Create config.json for OpenLane
           cat > config.json << EOF
