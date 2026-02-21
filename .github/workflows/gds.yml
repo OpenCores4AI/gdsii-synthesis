@@ -92,19 +92,20 @@ jobs:
           EOF
           
           # Create config.json for OpenLane
+          # CORRECCIÓN AQUÍ: Todo está indentado correctamente
           cat > config.json << EOF
-{
-  "DESIGN_NAME": "${MODULE_NAME}",
-  "VERILOG_FILES": "dir::src/${MODULE_NAME}.v",
-  "CLOCK_PORT": "clk",
-  "CLOCK_PERIOD": 20,
-  "PL_TARGET_DENSITY": 0.6,
-  "FP_SIZING": "absolute",
-  "DIE_AREA": "0 0 150 150",
-  "RUN_LINTER": 0,
-  "RUN_CTS": 1
-}
-EOF
+          {
+            "DESIGN_NAME": "${MODULE_NAME}",
+            "VERILOG_FILES": "dir::src/${MODULE_NAME}.v",
+            "CLOCK_PORT": "clk",
+            "CLOCK_PERIOD": 20,
+            "PL_TARGET_DENSITY": 0.6,
+            "FP_SIZING": "absolute",
+            "DIE_AREA": "0 0 150 150",
+            "RUN_LINTER": 0,
+            "RUN_CTS": 1
+          }
+          EOF
           
           echo "✅ TinyTapeout structure ready"
           ls -la
