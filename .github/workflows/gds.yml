@@ -17,11 +17,12 @@ on:
 jobs:
   gds:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          fetch-depth: 2
 
       - name: Extract project information
         id: info
@@ -30,48 +31,186 @@ jobs:
             PROJECT_ID="${{ github.event.inputs.project_id }}"
             MODULE_NAME="${{ github.event.inputs.module_name }}"
           else
-            # Extract from push
-            CHANGED=$(git diff-tree --no-commit-id --name-only -r ${{ github.sha }} | grep -E 'projects/.*/.*\.v$' | head -1)
+            # Use git diff with HEAD~1 (requires fetch-depth: 2)
+            CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E 'projects/.*/.*\.v$' | head -1 || true)
+            if [ -z "$CHANGED" ]; then
+              echo "::error::No Verilog files found in this push"
+              exit 1
+            fi
             PROJECT_ID=$(echo "$CHANGED" | cut -d'/' -f2)
             MODULE_NAME=$(basename "$CHANGED" .v)
           fi
-          
+
           echo "project_id=$PROJECT_ID" >> $GITHUB_OUTPUT
           echo "module_name=$MODULE_NAME" >> $GITHUB_OUTPUT
-          echo "✅ Project: $PROJECT_ID, Module: $MODULE_NAME"
+          echo "Project: $PROJECT_ID, Module: $MODULE_NAME"
 
       - name: Setup TinyTapeout structure
         run: |
           PROJECT_ID="${{ steps.info.outputs.project_id }}"
           MODULE_NAME="${{ steps.info.outputs.module_name }}"
-          
-          echo "📦 Setting up TinyTapeout-compatible structure..."
-          
-          # Create src directory for TinyTapeout
+
+          echo "Setting up TinyTapeout-compatible structure..."
+
           mkdir -p src
-          
-          # Copy HDL file to src/
-          if [ -f "projects/${PROJECT_ID}/${MODULE_NAME}.v" ]; then
-            cp "projects/${PROJECT_ID}/${MODULE_NAME}.v" "src/${MODULE_NAME}.v"
-            echo "✅ Copied Verilog: projects/${PROJECT_ID}/${MODULE_NAME}.v → src/${MODULE_NAME}.v"
-          else
-            echo "❌ File not found: projects/${PROJECT_ID}/${MODULE_NAME}.v"
+
+          SRC_FILE="projects/${PROJECT_ID}/${MODULE_NAME}.v"
+          if [ ! -f "$SRC_FILE" ]; then
+            echo "::error::File not found: $SRC_FILE"
             exit 1
           fi
-          
-          # Create info.yaml (required by TinyTapeout)
-          cat > info.yaml << 'EOF'
+
+          cp "$SRC_FILE" "src/${MODULE_NAME}.v"
+          echo "Copied: $SRC_FILE -> src/${MODULE_NAME}.v"
+
+      - name: Generate TinyTapeout wrapper
+        run: |
+          MODULE_NAME="${{ steps.info.outputs.module_name }}"
+
+          python3 << 'PYEOF'
+          import re, sys, os
+
+          module_name = os.environ.get('MODULE_NAME', '')
+          if not module_name:
+              # Fallback: read from GITHUB_OUTPUT
+              module_name = "${{ steps.info.outputs.module_name }}"
+
+          src_file = f"src/{module_name}.v"
+          with open(src_file) as f:
+              verilog = f.read()
+
+          # Parse module ports
+          # Find module declaration
+          m = re.search(r'module\s+(\w+)\s*\((.*?)\)\s*;', verilog, re.DOTALL)
+          if not m:
+              print(f"ERROR: Could not parse module in {src_file}")
+              sys.exit(1)
+
+          parsed_module = m.group(1)
+
+          # Parse port declarations
+          inputs = []
+          outputs = []
+          for line in verilog.split('\n'):
+              line = line.strip().rstrip(',')
+              # Match: input [wire] [N:M] name
+              pm = re.match(r'(input|output)\s+(?:wire|reg)?\s*(?:\[(\d+):(\d+)\])?\s*(\w+)', line)
+              if pm:
+                  direction = pm.group(1)
+                  hi = int(pm.group(2)) if pm.group(2) else 0
+                  lo = int(pm.group(3)) if pm.group(3) else 0
+                  name = pm.group(4)
+                  width = hi - lo + 1
+                  if direction == 'input':
+                      inputs.append((name, width))
+                  else:
+                      outputs.append((name, width))
+
+          # Generate TT wrapper
+          wrapper = """module tt_um_opencores (
+              input  wire [7:0] ui_in,
+              output wire [7:0] uo_out,
+              input  wire [7:0] uio_in,
+              output wire [7:0] uio_out,
+              output wire [7:0] uio_oe,
+              input  wire       ena,
+              input  wire       clk,
+              input  wire       rst_n
+          );
+
+          """
+
+          # Declare output wires
+          output_wires = []
+          for name, width in outputs:
+              if width == 1:
+                  wrapper += f"    wire w_{name};\n"
+              else:
+                  wrapper += f"    wire [{width-1}:0] w_{name};\n"
+              output_wires.append((name, width))
+
+          wrapper += f"\n    // Instantiate user design\n"
+          wrapper += f"    {parsed_module} user_design (\n"
+
+          # Generate port connections
+          connections = []
+          input_bit = 0
+          for name, width in inputs:
+              if name in ('clk', 'clock', 'CLK'):
+                  connections.append(f"        .{name}(clk)")
+              elif name in ('rst', 'reset', 'RST', 'RESET'):
+                  connections.append(f"        .{name}(~rst_n)")
+              elif name in ('rst_n', 'reset_n', 'RST_N', 'RESET_N', 'rstn', 'resetn'):
+                  connections.append(f"        .{name}(rst_n)")
+              elif name in ('ena', 'en', 'enable'):
+                  connections.append(f"        .{name}(ena)")
+              else:
+                  if width == 1:
+                      if input_bit < 8:
+                          connections.append(f"        .{name}(ui_in[{input_bit}])")
+                      else:
+                          connections.append(f"        .{name}(uio_in[{input_bit - 8}])")
+                      input_bit += 1
+                  else:
+                      connections.append(f"        .{name}(ui_in[{min(input_bit+width-1, 7)}:{input_bit}])")
+                      input_bit += width
+
+          for name, width in outputs:
+              connections.append(f"        .{name}(w_{name})")
+
+          wrapper += ",\n".join(connections)
+          wrapper += "\n    );\n\n"
+
+          # Map output wires to uo_out
+          out_bits = ["1'b0"] * 8
+          out_bit = 0
+          for name, width in output_wires:
+              for i in range(width):
+                  if out_bit < 8:
+                      if width == 1:
+                          out_bits[out_bit] = f"w_{name}"
+                      else:
+                          out_bits[out_bit] = f"w_{name}[{i}]"
+                  out_bit += 1
+
+          wrapper += f"    assign uo_out = {{{', '.join(reversed(out_bits))}}};\n"
+          wrapper += "    assign uio_out = 8'b0;\n"
+          wrapper += "    assign uio_oe  = 8'b0;\n\n"
+          wrapper += "endmodule\n"
+
+          # Write wrapper
+          with open("src/tt_um_opencores.v", "w") as f:
+              f.write(wrapper)
+
+          print(f"Generated TT wrapper for module '{parsed_module}'")
+          print(f"  Inputs: {inputs}")
+          print(f"  Outputs: {outputs}")
+          print("  Wrapper: src/tt_um_opencores.v")
+          PYEOF
+        env:
+          MODULE_NAME: ${{ steps.info.outputs.module_name }}
+
+      - name: Create info.yaml
+        run: |
+          MODULE_NAME="${{ steps.info.outputs.module_name }}"
+
+          cat > info.yaml << YAMLEOF
+          yaml_version: 6
+
           project:
-            title: "OpenCores Design"
-            author: "OpenCores.ai User"
-            description: "Auto-generated from OpenCores.ai"
-          
-          documentation:
+            title: "OpenCores Design - ${MODULE_NAME}"
             author: "OpenCores.ai"
-            title: "Auto-generated Design"
+            discord: ""
+            description: "Auto-generated from OpenCores.ai"
             language: "Verilog"
-            description: "Synthesized using TinyTapeout OpenLane2 flow"
-          
+            clock_hz: 50000000
+
+            source_files:
+              - tt_um_opencores.v
+              - ${MODULE_NAME}.v
+
+            top_module: "tt_um_opencores"
+
           pinout:
             ui[0]: "Input 0"
             ui[1]: "Input 1"
@@ -89,52 +228,44 @@ jobs:
             uo[5]: "Output 5"
             uo[6]: "Output 6"
             uo[7]: "Output 7"
-          EOF
-          
-          # Create config.json for OpenLane
-          # CORRECCIÓN AQUÍ: Todo está indentado correctamente
-          cat > config.json << EOF
-          {
-            "DESIGN_NAME": "${MODULE_NAME}",
-            "VERILOG_FILES": "dir::src/${MODULE_NAME}.v",
-            "CLOCK_PORT": "clk",
-            "CLOCK_PERIOD": 20,
-            "PL_TARGET_DENSITY": 0.6,
-            "FP_SIZING": "absolute",
-            "DIE_AREA": "0 0 150 150",
-            "RUN_LINTER": 0,
-            "RUN_CTS": 1
-          }
-          EOF
-          
-          echo "✅ TinyTapeout structure ready"
-          ls -la
+          YAMLEOF
+
+          # Remove leading whitespace from heredoc (YAML is indentation-sensitive)
+          sed -i 's/^          //' info.yaml
+
+          echo "info.yaml created:"
+          cat info.yaml
+          echo "---"
+          echo "src/ contents:"
+          ls -la src/
+          cat src/tt_um_opencores.v
 
       - name: Build GDS with TinyTapeout
         uses: TinyTapeout/tt-gds-action@tt10
-        
+
       - name: Verify GDS generation
         id: verify
         run: |
-          echo "🔍 Looking for generated GDS files..."
-          
-          # TinyTapeout creates runs/wokwi/results/final/gds/
+          echo "Looking for generated GDS files..."
+
           if [ -d "runs" ]; then
             find runs -name "*.gds" -type f -exec ls -lh {} \;
-            
+
             GDS_FILE=$(find runs -name "*.gds" -type f | head -1)
-            
+
             if [ -n "$GDS_FILE" ] && [ -f "$GDS_FILE" ]; then
               echo "gds_path=$GDS_FILE" >> $GITHUB_OUTPUT
-              SIZE=$(stat -f%z "$GDS_FILE" 2>/dev/null || stat -c%s "$GDS_FILE")
+              SIZE=$(stat -c%s "$GDS_FILE" 2>/dev/null || stat -f%z "$GDS_FILE")
               echo "gds_size=$SIZE" >> $GITHUB_OUTPUT
-              echo "✅ GDS found: $GDS_FILE ($SIZE bytes)"
+              echo "GDS found: $GDS_FILE ($SIZE bytes)"
             else
-              echo "❌ No GDS file generated!"
+              echo "::error::No GDS file generated"
               exit 1
             fi
           else
-            echo "❌ No runs directory found!"
+            echo "::error::No runs directory found"
+            # Show what we have for debugging
+            ls -la
             exit 1
           fi
 
@@ -151,10 +282,9 @@ jobs:
 
       - name: Success summary
         run: |
-          echo "🎉 GDSII Generation Complete!"
+          echo "GDSII Generation Complete!"
           echo "================================"
           echo "Module: ${{ steps.info.outputs.module_name }}"
           echo "GDS File: ${{ steps.verify.outputs.gds_path }}"
           echo "Size: ${{ steps.verify.outputs.gds_size }} bytes"
           echo "================================"
-          echo "✅ Artifact uploaded successfully"
