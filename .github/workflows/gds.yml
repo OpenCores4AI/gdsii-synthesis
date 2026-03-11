@@ -330,3 +330,19 @@ jobs:
           echo "GDS File: ${{ steps.verify.outputs.gds_path }}"
           echo "Size: ${{ steps.verify.outputs.gds_size }} bytes"
           echo "================================"
+
+  precheck:
+    needs: gds
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Run Tiny Tapeout Precheck
+        uses: TinyTapeout/tt-gds-action/precheck@tt10
+
+  viewer:
+    needs: gds
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: TinyTapeout/tt-gds-action/viewer@tt10
