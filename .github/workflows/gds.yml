@@ -88,10 +88,13 @@ jobs:
 
           parsed_module = m.group(1)
 
-          # Parse port declarations
+          # Parse port declarations - only from the first module (before first endmodule)
+          first_module_end = verilog.find('endmodule')
+          first_module_text = verilog[:first_module_end] if first_module_end != -1 else verilog
           inputs = []
           outputs = []
-          for line in verilog.split('\n'):
+          seen_ports = set()
+          for line in first_module_text.split('\n'):
               line = line.strip().rstrip(',')
               # Match: input [wire] [N:M] name
               pm = re.match(r'(input|output)\s+(?:wire|reg)?\s*(?:\[(\d+):(\d+)\])?\s*(\w+)', line)
@@ -100,6 +103,9 @@ jobs:
                   hi = int(pm.group(2)) if pm.group(2) else 0
                   lo = int(pm.group(3)) if pm.group(3) else 0
                   name = pm.group(4)
+                  if name in seen_ports:
+                      continue
+                  seen_ports.add(name)
                   width = hi - lo + 1
                   if direction == 'input':
                       inputs.append((name, width))
