@@ -141,25 +141,46 @@ jobs:
           # Generate port connections
           connections = []
           input_bit = 0
+          has_clock = False
+          clk_names = ('clk', 'clock', 'i_clk', 'i_clock', 'sys_clk')
+          rst_names = ('rst', 'reset', 'i_rst', 'i_reset')
+          rstn_names = ('rst_n', 'reset_n', 'rstn', 'resetn', 'i_rst_n', 'i_reset_n', 'i_rstn', 'i_resetn', 'nrst', 'nreset')
+          ena_names = ('ena', 'en', 'enable', 'i_ena', 'i_en', 'i_enable')
           for name, width in inputs:
               nl = name.lower()
-              if nl in ('clk', 'clock', 'i_clk', 'i_clock', 'sys_clk'):
+              if nl in clk_names:
                   connections.append(f"        .{name}(clk)")
-              elif nl in ('rst', 'reset', 'i_rst', 'i_reset'):
+                  has_clock = True
+              elif nl in rst_names:
                   connections.append(f"        .{name}(~rst_n)")
-              elif nl in ('rst_n', 'reset_n', 'rstn', 'resetn', 'i_rst_n', 'i_reset_n', 'i_rstn', 'i_resetn', 'nrst', 'nreset'):
+              elif nl in rstn_names:
                   connections.append(f"        .{name}(rst_n)")
-              elif nl in ('ena', 'en', 'enable', 'i_ena', 'i_en', 'i_enable'):
+              elif nl in ena_names:
                   connections.append(f"        .{name}(ena)")
               else:
+                  # Map to ui_in[0:7] then uio_in[0:7], clamping to available pins
+                  for bit in range(width):
+                      pin = input_bit + bit
                   if width == 1:
                       if input_bit < 8:
                           connections.append(f"        .{name}(ui_in[{input_bit}])")
-                      else:
+                      elif input_bit < 16:
                           connections.append(f"        .{name}(uio_in[{input_bit - 8}])")
+                      else:
+                          connections.append(f"        .{name}(1'b0)")
                       input_bit += 1
                   else:
-                      connections.append(f"        .{name}(ui_in[{min(input_bit+width-1, 7)}:{input_bit}])")
+                      # Build concatenation for wide ports across ui_in/uio_in
+                      bits = []
+                      for b in range(width):
+                          pin = input_bit + b
+                          if pin < 8:
+                              bits.append(f"ui_in[{pin}]")
+                          elif pin < 16:
+                              bits.append(f"uio_in[{pin - 8}]")
+                          else:
+                              bits.append("1'b0")
+                      connections.append(f"        .{name}({{{', '.join(reversed(bits))}}})")
                       input_bit += width
 
           for name, width in outputs:
@@ -168,8 +189,10 @@ jobs:
           wrapper += ",\n".join(connections)
           wrapper += "\n    );\n\n"
 
-          # Map output wires to uo_out
+          # Map output wires to uo_out and uio_out
           out_bits = ["1'b0"] * 8
+          uio_bits = ["1'b0"] * 8
+          uio_oe_bits = ["1'b0"] * 8
           out_bit = 0
           for name, width in output_wires:
               for i in range(width):
@@ -178,20 +201,32 @@ jobs:
                           out_bits[out_bit] = f"w_{name}"
                       else:
                           out_bits[out_bit] = f"w_{name}[{i}]"
+                  elif out_bit < 16:
+                      uio_idx = out_bit - 8
+                      if width == 1:
+                          uio_bits[uio_idx] = f"w_{name}"
+                      else:
+                          uio_bits[uio_idx] = f"w_{name}[{i}]"
+                      uio_oe_bits[uio_idx] = "1'b1"
                   out_bit += 1
 
-          wrapper += f"    assign uo_out = {{{', '.join(reversed(out_bits))}}};\n"
-          wrapper += "    assign uio_out = 8'b0;\n"
-          wrapper += "    assign uio_oe  = 8'b0;\n\n"
+          wrapper += f"    assign uo_out  = {{{', '.join(reversed(out_bits))}}};\n"
+          wrapper += f"    assign uio_out = {{{', '.join(reversed(uio_bits))}}};\n"
+          wrapper += f"    assign uio_oe  = {{{', '.join(reversed(uio_oe_bits))}}};\n\n"
           wrapper += "endmodule\n"
 
           # Write wrapper
           with open("src/tt_um_opencores.v", "w") as f:
               f.write(wrapper)
 
+          # Write clock flag for config step
+          with open("/tmp/has_clock", "w") as f:
+              f.write("1" if has_clock else "0")
+
           print(f"Generated TT wrapper for module '{parsed_module}'")
           print(f"  Inputs: {inputs}")
           print(f"  Outputs: {outputs}")
+          print(f"  Has clock: {has_clock}")
           print("  Wrapper: src/tt_um_opencores.v")
           PYEOF
         env:
@@ -258,7 +293,20 @@ jobs:
 
       - name: Create OpenLane config
         run: |
-          cat > src/config.json << 'CFGEOF'
+          HAS_CLOCK="1"
+          if [ -f /tmp/has_clock ]; then
+            HAS_CLOCK=$(cat /tmp/has_clock)
+          fi
+
+          if [ "$HAS_CLOCK" = "1" ]; then
+            CLOCK_PORT="clk"
+            RUN_CTS=1
+          else
+            CLOCK_PORT=""
+            RUN_CTS=0
+          fi
+
+          cat > src/config.json << CFGEOF
           {
             "PL_TARGET_DENSITY_PCT": 60,
             "CLOCK_PERIOD": 20,
@@ -266,7 +314,7 @@ jobs:
             "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.05,
             "RUN_LINTER": 1,
             "LINTER_INCLUDE_PDK_MODELS": 1,
-            "CLOCK_PORT": "clk",
+            "CLOCK_PORT": "${CLOCK_PORT}",
             "RUN_KLAYOUT_XOR": 0,
             "RUN_KLAYOUT_DRC": 0,
             "DESIGN_REPAIR_BUFFER_OUTPUT_PORTS": 0,
@@ -279,7 +327,7 @@ jobs:
             "FP_IO_HLENGTH": 2,
             "FP_IO_VLENGTH": 2,
             "FP_PDN_VPITCH": 38.87,
-            "RUN_CTS": 1,
+            "RUN_CTS": ${RUN_CTS},
             "FP_PDN_MULTILAYER": 0,
             "RT_MAX_LAYER": "met4",
             "MAGIC_DEF_LABELS": 0,
@@ -287,7 +335,8 @@ jobs:
           }
           CFGEOF
           sed -i 's/^          //' src/config.json
-          echo "src/config.json created"
+          echo "src/config.json created (has_clock=$HAS_CLOCK)"
+          cat src/config.json
 
       - name: Build GDS with TinyTapeout
         uses: TinyTapeout/tt-gds-action@tt10
