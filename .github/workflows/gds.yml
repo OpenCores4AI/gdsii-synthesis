@@ -80,8 +80,8 @@ jobs:
               verilog = f.read()
 
           # Parse module ports
-          # Find module declaration
-          m = re.search(r'module\s+(\w+)\s*\((.*?)\)\s*;', verilog, re.DOTALL)
+          # Find module declaration (handles optional #(parameters) block)
+          m = re.search(r'module\s+(\w+)\s*(?:#\s*\(.*?\))?\s*\((.*?)\)\s*;', verilog, re.DOTALL)
           if not m:
               print(f"ERROR: Could not parse module in {src_file}")
               sys.exit(1)
@@ -136,13 +136,14 @@ jobs:
           connections = []
           input_bit = 0
           for name, width in inputs:
-              if name in ('clk', 'clock', 'CLK'):
+              nl = name.lower()
+              if nl in ('clk', 'clock', 'i_clk', 'i_clock', 'sys_clk'):
                   connections.append(f"        .{name}(clk)")
-              elif name in ('rst', 'reset', 'RST', 'RESET'):
+              elif nl in ('rst', 'reset', 'i_rst', 'i_reset'):
                   connections.append(f"        .{name}(~rst_n)")
-              elif name in ('rst_n', 'reset_n', 'RST_N', 'RESET_N', 'rstn', 'resetn'):
+              elif nl in ('rst_n', 'reset_n', 'rstn', 'resetn', 'i_rst_n', 'i_reset_n', 'i_rstn', 'i_resetn', 'nrst', 'nreset'):
                   connections.append(f"        .{name}(rst_n)")
-              elif name in ('ena', 'en', 'enable'):
+              elif nl in ('ena', 'en', 'enable', 'i_ena', 'i_en', 'i_enable'):
                   connections.append(f"        .{name}(ena)")
               else:
                   if width == 1:
