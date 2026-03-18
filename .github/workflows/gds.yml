@@ -96,17 +96,31 @@ jobs:
           seen_ports = set()
           for line in first_module_text.split('\n'):
               line = line.strip().rstrip(',')
-              # Match: input [wire] [N:M] name
-              pm = re.match(r'(input|output)\s+(?:wire|reg)?\s*(?:\[(\d+):(\d+)\])?\s*(\w+)', line)
+              # Match: input/output [wire/reg] [range] name
+              # Try with explicit wire/reg first (prevents backtracking bug)
+              pm = re.match(r'(input|output)\s+(?:wire|reg)\s+(?:\[([^\]]+)\]\s*)?(\w+)', line)
+              if not pm:
+                  # Fallback: no wire/reg keyword
+                  pm = re.match(r'(input|output)\s+(?:\[([^\]]+)\]\s*)?(\w+)', line)
               if pm:
                   direction = pm.group(1)
-                  hi = int(pm.group(2)) if pm.group(2) else 0
-                  lo = int(pm.group(3)) if pm.group(3) else 0
-                  name = pm.group(4)
+                  range_str = pm.group(2)
+                  name = pm.group(3)
+                  if name in ('wire', 'reg', 'input', 'output'):
+                      continue  # keyword captured by mistake
                   if name in seen_ports:
                       continue
                   seen_ports.add(name)
-                  width = hi - lo + 1
+                  # Parse width — supports literal [7:0] and parameterized [WIDTH-1:0]
+                  width = 1
+                  if range_str:
+                      parts = range_str.split(':')
+                      try:
+                          hi = int(parts[0].strip())
+                          lo = int(parts[1].strip())
+                          width = hi - lo + 1
+                      except (ValueError, IndexError):
+                          width = 8  # safe default for parameterized widths
                   if direction == 'input':
                       inputs.append((name, width))
                   else:
