@@ -1,0 +1,228 @@
+name: Verification Mesh
+
+# Runs the OpenCores 6-agent verification mesh against a design pushed
+# to projects/<design_id>/. Emits a single verification.json artifact
+# that the Vercel API consumes and re-emits as OrchestratorEvent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      design_id:
+        description: 'Design ID (subdirectory under projects/)'
+        required: true
+      top_module:
+        description: 'Top module name'
+        required: true
+      pdk:
+        description: 'Target PDK'
+        required: true
+        default: 'sky130'
+        type: choice
+        options: [sky130, gf180mcu, sg13g2]
+  push:
+    paths:
+      - 'projects/verify-**/*.v'
+      - 'projects/verify-**/*.sv'
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve design under verification
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DESIGN_ID="${{ github.event.inputs.design_id }}"
+            TOP="${{ github.event.inputs.top_module }}"
+            PDK="${{ github.event.inputs.pdk }}"
+          else
+            CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E 'projects/verify-.*\.(v|sv)$' | head -1 || true)
+            if [ -z "$CHANGED" ]; then
+              echo "::error::No verify- design changes detected"
+              exit 1
+            fi
+            DESIGN_ID=$(echo "$CHANGED" | cut -d'/' -f2)
+            TOP=$(basename "$CHANGED" | sed 's/\.[^.]*$//')
+            PDK="sky130"
+          fi
+          echo "design_id=$DESIGN_ID" >> $GITHUB_OUTPUT
+          echo "top_module=$TOP"      >> $GITHUB_OUTPUT
+          echo "pdk=$PDK"             >> $GITHUB_OUTPUT
+          echo "Design: $DESIGN_ID  top=$TOP  pdk=$PDK"
+
+      - name: Install EDA tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y verilator iverilog yosys jq python3
+          verilator --version
+          iverilog -V | head -1
+          yosys -V | head -1
+
+      - name: Run verification mesh
+        id: mesh
+        shell: bash
+        env:
+          DESIGN_ID:  ${{ steps.meta.outputs.design_id }}
+          TOP_MODULE: ${{ steps.meta.outputs.top_module }}
+          PDK:        ${{ steps.meta.outputs.pdk }}
+        run: |
+          set +e
+          mkdir -p mesh-out
+          SRC_DIR="projects/${DESIGN_ID}"
+          if [ ! -d "$SRC_DIR" ]; then
+            echo "::error::Project dir $SRC_DIR missing"; exit 1
+          fi
+
+          SOURCES=$(find "$SRC_DIR" -maxdepth 2 \( -name '*.v' -o -name '*.sv' \) ! -name 'tb.v' ! -name 'tb_*.v' ! -name '*tb*.v')
+          TB=$(find "$SRC_DIR" -maxdepth 2 \( -name 'tb.v' -o -name 'tb_*.v' \) | head -1)
+          echo "sources: $SOURCES"
+          echo "testbench: $TB"
+
+          START_ALL=$(date +%s%3N)
+
+          # ---------- LINT (verilator) ----------
+          LINT_T0=$(date +%s%3N)
+          verilator --lint-only -Wall --top-module "$TOP_MODULE" $SOURCES 1> mesh-out/lint.stdout 2> mesh-out/lint.stderr
+          LINT_EXIT=$?
+          LINT_T1=$(date +%s%3N)
+
+          # ---------- SIM (icarus) ----------
+          SIM_SKIPPED=1; SIM_EXIT=0
+          SIM_T0=$(date +%s%3N)
+          if [ -n "$TB" ]; then
+            SIM_SKIPPED=0
+            iverilog -g2012 -o mesh-out/sim.out $SOURCES "$TB" 1> mesh-out/sim_compile.stdout 2> mesh-out/sim_compile.stderr
+            CC=$?
+            if [ $CC -eq 0 ]; then
+              ( cd mesh-out && vvp sim.out ) 1> mesh-out/sim.stdout 2> mesh-out/sim.stderr
+              SIM_EXIT=$?
+            else
+              SIM_EXIT=$CC
+              cat mesh-out/sim_compile.stderr > mesh-out/sim.stderr
+            fi
+          fi
+          SIM_T1=$(date +%s%3N)
+
+          # ---------- COVERAGE (verilator --coverage) ----------
+          COV_SKIPPED=1; COV_EXIT=0; COV_TOTAL="n/a"
+          COV_T0=$(date +%s%3N)
+          if [ -n "$TB" ]; then
+            COV_SKIPPED=0
+            verilator --cc --coverage --build --exe --main --top-module "$TOP_MODULE" \
+              $SOURCES "$TB" -o cov_sim --Mdir mesh-out/obj_cov \
+              1> mesh-out/cov_build.stdout 2> mesh-out/cov_build.stderr
+            COV_EXIT=$?
+            if [ -x mesh-out/obj_cov/cov_sim ]; then
+              ( cd mesh-out/obj_cov && ./cov_sim ) > /dev/null 2>&1 || true
+              verilator_coverage --write-info mesh-out/coverage.info mesh-out/obj_cov/coverage.dat 1> mesh-out/coverage.stdout 2> mesh-out/coverage.stderr || true
+              if [ -f mesh-out/coverage.info ]; then
+                COV_TOTAL=$(grep -E '^DA:' mesh-out/coverage.info | awk -F, 'BEGIN{c=0;t=0}{t++; if ($2>0) c++} END{ if (t>0) printf "%.3f", c/t; else printf "n/a"}')
+              fi
+            fi
+          fi
+          COV_T1=$(date +%s%3N)
+
+          # ---------- STA / CORNER / DRC-LVS (skipped in base job) ----------
+          # These require OpenSTA / Magic / KLayout / netgen. Marked as
+          # skipped so the report still has a row for every agent.
+
+          END_ALL=$(date +%s%3N)
+          DUR_ALL=$((END_ALL - START_ALL))
+
+          # Export every measurement so the python heredoc below sees them
+          # via os.environ. DESIGN_ID / TOP_MODULE / PDK already arrive via
+          # the step-level env block.
+          export LINT_T0 LINT_T1 SIM_T0 SIM_T1 SIM_EXIT SIM_SKIPPED
+          export COV_T0 COV_T1 COV_SKIPPED COV_TOTAL DUR_ALL
+
+          # ---------- Emit verification.json ----------
+          python3 - <<'PY' > mesh-out/verification.json
+          import json, os, time, datetime
+          def read(p):
+              try:
+                  with open(p, 'r', errors='replace') as f:
+                      return f.read()
+              except FileNotFoundError:
+                  return ""
+          def lint_diags(s):
+              import re
+              out = []
+              for m in re.finditer(r'^%(Error|Warning|Info)(?:-([A-Z_]+))?:\s+([^:]+):(\d+)(?::(\d+))?:\s+(.+)$', s, re.M):
+                  sev = m.group(1).lower(); sev = 'error' if sev == 'error' else ('warning' if sev == 'warning' else 'info')
+                  out.append({
+                      "severity": sev,
+                      "code": m.group(2) or "VERILATOR",
+                      "message": m.group(6).strip(),
+                      "location": {"file": m.group(3), "line": int(m.group(4)), **({"column": int(m.group(5))} if m.group(5) else {})},
+                  })
+              return out
+          def sim_diags(s):
+              diags = []
+              for line in s.splitlines():
+                  if 'FATAL' in line.upper() or '$fatal' in line: diags.append({"severity":"fatal","code":"SIM_FATAL","message":line.strip()})
+                  elif 'ERROR' in line.upper() or '$error' in line: diags.append({"severity":"error","code":"SIM_ERROR","message":line.strip()})
+                  elif 'Assertion' in line and 'failed' in line: diags.append({"severity":"error","code":"ASSERT_FAILED","message":line.strip()})
+              return diags
+
+          design_id = os.environ['DESIGN_ID'][len('verify-'):] if os.environ['DESIGN_ID'].startswith('verify-') else os.environ['DESIGN_ID']
+          top       = os.environ['TOP_MODULE']
+          pdk       = os.environ['PDK']
+
+          lint_stderr = read('mesh-out/lint.stderr') + read('mesh-out/lint.stdout')
+          sim_out     = read('mesh-out/sim.stdout') + read('mesh-out/sim.stderr') + read('mesh-out/sim_compile.stderr')
+
+          lint_d = lint_diags(lint_stderr)
+          lint_errors = sum(1 for d in lint_d if d['severity'] in ('error','fatal'))
+          sim_d  = sim_diags(sim_out) if int(os.environ.get('SIM_SKIPPED','1')) == 0 else []
+          sim_errors = sum(1 for d in sim_d if d['severity'] in ('error','fatal'))
+
+          def agent(name, pass_, diags, metrics=None, skipped=False, reason=None, dur=0):
+              return {
+                  "agent": name, "pass": pass_, "diagnostics": diags, "suggestedFixes": [],
+                  "artifacts": [], "metrics": metrics or {}, "durationMs": dur,
+                  "skipped": skipped, **({"skipReason": reason} if reason else {}),
+              }
+
+          LINT_DUR = int(os.environ['LINT_T1']) - int(os.environ['LINT_T0'])
+          SIM_DUR  = int(os.environ['SIM_T1'])  - int(os.environ['SIM_T0'])
+          COV_DUR  = int(os.environ['COV_T1'])  - int(os.environ['COV_T0'])
+          DUR_ALL  = int(os.environ['DUR_ALL'])
+
+          agents = [
+              agent("lint",    lint_errors == 0, lint_d, {"errors": lint_errors, "warnings": sum(1 for d in lint_d if d['severity']=='warning')}, dur=LINT_DUR),
+              agent("sim",     sim_errors == 0 and int(os.environ.get('SIM_EXIT','0'))==0, sim_d, {"exitCode": int(os.environ.get('SIM_EXIT','0'))}, skipped=int(os.environ.get('SIM_SKIPPED','1'))==1, reason="no testbench supplied" if int(os.environ.get('SIM_SKIPPED','1'))==1 else None, dur=SIM_DUR),
+              agent("sta",     False, [], skipped=True, reason="OpenSTA not installed in base runner"),
+              agent("corner",  False, [], skipped=True, reason="edge stimulus generator runs on the application server"),
+              agent("coverage",os.environ.get('COV_TOTAL','n/a') != 'n/a' and float(os.environ.get('COV_TOTAL','0') or 0) >= 0.9, [], {"overall": os.environ.get('COV_TOTAL','n/a')}, skipped=int(os.environ.get('COV_SKIPPED','1'))==1, reason="no testbench supplied" if int(os.environ.get('COV_SKIPPED','1'))==1 else None, dur=COV_DUR),
+              agent("drc-lvs", False, [], skipped=True, reason="PDK ruledecks not staged in base runner"),
+          ]
+          report = {
+              "designId": design_id,
+              "topModule": top,
+              "pdk": pdk,
+              "pass": all(a['pass'] or a['skipped'] for a in agents),
+              "iteration": 0,
+              "startedAt": datetime.datetime.utcnow().isoformat() + "Z",
+              "finishedAt": datetime.datetime.utcnow().isoformat() + "Z",
+              "durationMs": DUR_ALL,
+              "agents": agents,
+              "aggregatedFixes": [],
+          }
+          print(json.dumps(report, indent=2))
+          PY
+          cat mesh-out/verification.json
+          true
+
+      - name: Upload verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-${{ steps.meta.outputs.design_id }}
+          path: mesh-out/
+          if-no-files-found: error
+          retention-days: 7
