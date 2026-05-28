@@ -11,6 +11,11 @@
 # =============================================================================
 
 name: verify
+# Unique run name so the Vercel app can locate THIS run via the GitHub API
+# even when several mesh invocations race. Without this, listWorkflowRuns
+# returns whichever run finished most recently and the app may read the
+# wrong artifact and report a false-fail mesh.
+run-name: "verify-${{ inputs.design_id }}"
 
 on:
   workflow_dispatch:
