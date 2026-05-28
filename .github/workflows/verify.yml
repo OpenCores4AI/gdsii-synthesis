@@ -204,20 +204,30 @@ jobs:
             exit 0
           fi
           rtl=$(ls *.v | grep -v '^tb\.v$')
+          # Build + run + annotate inside ONE docker invocation. Doing it
+          # in a single container avoids libstdc++ ABI mismatches between
+          # the runner (ubuntu-22.04) and the container that produced Vtb.
+          # The cov_build.err / cov_summary.log files land in the mounted
+          # work dir so the runner can read them afterwards.
           set +e
-          verilator --binary --coverage -Wno-fatal --top-module tb $rtl tb.v 2> cov_build.err
-          build_ec=$?
+          docker run --rm -v "$PWD:/work" -w /work -e OBJCACHE= \
+            --user "$(id -u):$(id -g)" \
+            --entrypoint bash verilator/verilator:latest -c "
+              set +e
+              verilator --binary --coverage -Wno-fatal --top-module tb $rtl tb.v 2> cov_build.err
+              ec=\$?
+              if [ \$ec -ne 0 ]; then exit \$ec; fi
+              ./obj_dir/Vtb > cov_run.log 2>&1 || true
+              mkdir -p logs/coverage_annotated
+              verilator_coverage --annotate logs/coverage_annotated coverage.dat > cov_summary.log 2>&1 || true
+              exit 0
+            "
+          docker_ec=$?
           set -e
-          if [ $build_ec -ne 0 ]; then
-            # Surface the verilator stderr in the diagnostic so failures
-            # are diagnosable from the UI without having to open the
-            # runner log.
-            python3 ../scripts/parse_coverage.py cov_build.err "$build_ec" build > ../coverage.json
+          if [ ! -f coverage.dat ]; then
+            python3 ../scripts/parse_coverage.py cov_build.err "$docker_ec" build > ../coverage.json
             exit 0
           fi
-          ./obj_dir/Vtb > cov_run.log 2>&1 || true
-          mkdir -p logs/coverage_annotated
-          verilator_coverage --annotate logs/coverage_annotated coverage.dat > cov_summary.log 2>&1 || true
           python3 ../scripts/parse_coverage.py cov_summary.log 0 annotate > ../coverage.json
 
       # ---------------------------------------------------------------------
