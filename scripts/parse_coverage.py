@@ -6,11 +6,24 @@ THRESHOLD = 0.85
 
 def main():
     path, exit_code, phase = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-    if phase == "build" or not path:
+    if phase == "build":
+        # Surface the actual stderr in the diagnostic so the UI shows what
+        # verilator complained about, not a generic "build failed".
+        err_text = ""
+        try:
+            if path:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    err_text = f.read()
+        except FileNotFoundError:
+            pass
+        excerpt = err_text.strip().splitlines()[-12:] if err_text.strip() else []
+        msg = "Verilator coverage build failed."
+        if excerpt:
+            msg += "\n" + "\n".join(excerpt)
         print(json.dumps({
             "agent": "coverage", "pass": False,
             "diagnostics": [{"severity": "error", "code": "COVERAGE_BUILD",
-                             "message": "Verilator coverage build failed."}],
+                             "message": msg}],
             "suggestedFixes": [], "artifacts": [],
             "metrics": {"exitCode": exit_code, "phase": "build"},
             "durationMs": 0, "skipped": False,
