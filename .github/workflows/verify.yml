@@ -283,30 +283,22 @@ jobs:
           gds=$(find synth -name "${TOP}.gds" | head -n1 || true)
           netlist=$(find synth -name "${TOP}.v" -o -name "${TOP}_netlist.v" | head -n1 || true)
           if [ -z "$gds" ] || [ -z "$netlist" ]; then
-            python3 - <<'EOF' > drclvs.json
-import json
-print(json.dumps({
-  "agent":"drc-lvs","pass":False,"diagnostics":[],"suggestedFixes":[],
-  "artifacts":[],"metrics":{},"durationMs":0,
-  "skipped":True,
-  "skipReason":"GDS or netlist missing — run synthesis first"
-}))
-EOF
+            printf '%s\n' '{"agent":"drc-lvs","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"GDS or netlist missing — run synthesis first"}' > drclvs.json
             exit 0
           fi
           docker pull efabless/openlane:latest >/dev/null
-          # The OpenLane image bundles magic + netgen + sky130A.
-          docker run --rm -v "$PWD:/w" -w /w efabless/openlane:latest bash -lc "
-            magic -dnull -noconsole <<MAGIC > drc.log 2>&1
-            gds read $gds
-            load $TOP
-            drc check
-            drc catchup
-            drc count
-            quit -noprompt
-MAGIC
-            netgen -batch lvs '$netlist $TOP' '$gds $TOP' /PDK/sky130A/libs.tech/netgen/sky130A_setup.tcl lvs.log
-          " || true
+          # Build the magic script first so the inner heredoc doesn't have
+          # to live inside the YAML block scalar (column-0 lines would
+          # terminate the |-block).
+          {
+            echo "gds read $gds"
+            echo "load $TOP"
+            echo "drc check"
+            echo "drc catchup"
+            echo "drc count"
+            echo "quit -noprompt"
+          } > magic.tcl
+          docker run --rm -v "$PWD:/w" -w /w efabless/openlane:latest bash -lc "magic -dnull -noconsole -rcfile /dev/null < magic.tcl > drc.log 2>&1; netgen -batch lvs '$netlist $TOP' '$gds $TOP' /PDK/sky130A/libs.tech/netgen/sky130A_setup.tcl lvs.log" || true
           python3 scripts/parse_drc_lvs.py drc.log lvs.log > drclvs.json
 
       # ---------------------------------------------------------------------
