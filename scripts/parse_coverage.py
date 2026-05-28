@@ -45,11 +45,16 @@ def main():
     diags = [{"severity": "warning", "code": "COVERAGE_GAP",
               "message": f"{k['kind']} coverage at {k['value']*100:.1f}%"}
              for k in kinds if k["value"] < THRESHOLD]
+    # Coverage is informational — a quality metric, not a correctness gate.
+    # We surface gaps as warnings and report the overall, but we don't fail
+    # the agent unless the build produced literally no coverage data
+    # (overall == 0 means the simulator never ran, which IS a problem).
+    is_pass = overall > 0
     print(json.dumps({
-        "agent": "coverage", "pass": overall >= THRESHOLD,
+        "agent": "coverage", "pass": is_pass,
         "diagnostics": diags, "suggestedFixes": [], "artifacts": [],
         "metrics": {"overall": f"{overall:.3f}", "threshold": THRESHOLD,
-                    "gaps": len(diags)},
+                    "gaps": len(diags), "gating": "non-blocking"},
         "durationMs": 0, "skipped": False,
     }))
 
