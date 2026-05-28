@@ -61,37 +61,34 @@ jobs:
       # ---------------------------------------------------------------------
       # Toolchain
       # ---------------------------------------------------------------------
-      # Verilator 5 ships in Ubuntu 24.04 but not 22.04, so we build it
-      # ourselves. Icarus is fine from apt. OpenSTA + Magic + netgen come
-      # from the openroad/flow-scripts container which we mount as a side
-      # step only when sta / drc-lvs are requested.
-      - name: Install Icarus + build deps
+      # Verilator 5 comes from the official verilator/verilator image —
+      # baked once, pulled in seconds, vs ~7 min to compile from source.
+      # Icarus is fine from apt. OpenSTA + Magic + netgen are pulled as
+      # separate containers only when sta / drc-lvs are requested.
+      - name: Install Icarus + sundries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            iverilog git make g++ python3 python3-pip \
-            autoconf flex bison help2man perl libfl2 libfl-dev zlib1g zlib1g-dev \
-            ca-certificates jq
+            iverilog python3 ca-certificates jq
 
-      - name: Cache Verilator 5
-        id: verilator-cache
-        uses: actions/cache@v4
-        with:
-          path: /opt/verilator
-          key: verilator-5.026-ubuntu22
+      - name: Pull Verilator 5 image
+        run: docker pull verilator/verilator:latest
 
-      - name: Build Verilator 5
-        if: steps.verilator-cache.outputs.cache-hit != 'true'
+      - name: Install verilator wrapper
         run: |
-          git clone --branch v5.026 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
-          cd /tmp/verilator-src
-          autoconf
-          ./configure --prefix=/opt/verilator
-          make -j"$(nproc)"
-          sudo make install
-
-      - name: Add Verilator to PATH
-        run: echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+          # Wrap the docker invocation so downstream steps can call
+          # `verilator` and `verilator_coverage` as if they were native
+          # binaries. The container mounts the runner's $PWD and runs as
+          # the runner user so the outputs come out owned correctly.
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'docker run --rm -v "$PWD:/work" -w /work --user "$(id -u):$(id -g)" verilator/verilator:latest "$@"' \
+            | sudo tee /usr/local/bin/verilator >/dev/null
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'docker run --rm -v "$PWD:/work" -w /work --user "$(id -u):$(id -g)" --entrypoint verilator_coverage verilator/verilator:latest "$@"' \
+            | sudo tee /usr/local/bin/verilator_coverage >/dev/null
+          sudo chmod +x /usr/local/bin/verilator /usr/local/bin/verilator_coverage
 
       - name: Print tool versions
         run: |
