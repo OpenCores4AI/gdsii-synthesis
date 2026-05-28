@@ -80,9 +80,11 @@ jobs:
           # `verilator` and `verilator_coverage` as if they were native
           # binaries. The container mounts the runner's $PWD and runs as
           # the runner user so the outputs come out owned correctly.
+          # OBJCACHE='' disables ccache, which the verilator image does not
+          # ship; without this the --binary build dies on "ccache: not found".
           printf '%s\n' \
             '#!/usr/bin/env bash' \
-            'docker run --rm -v "$PWD:/work" -w /work --user "$(id -u):$(id -g)" verilator/verilator:latest "$@"' \
+            'docker run --rm -v "$PWD:/work" -w /work -e OBJCACHE= --user "$(id -u):$(id -g)" verilator/verilator:latest "$@"' \
             | sudo tee /usr/local/bin/verilator >/dev/null
           printf '%s\n' \
             '#!/usr/bin/env bash' \
@@ -207,7 +209,10 @@ jobs:
           build_ec=$?
           set -e
           if [ $build_ec -ne 0 ]; then
-            python3 ../scripts/parse_coverage.py "" "$build_ec" build > ../coverage.json
+            # Surface the verilator stderr in the diagnostic so failures
+            # are diagnosable from the UI without having to open the
+            # runner log.
+            python3 ../scripts/parse_coverage.py cov_build.err "$build_ec" build > ../coverage.json
             exit 0
           fi
           ./obj_dir/Vtb > cov_run.log 2>&1 || true
