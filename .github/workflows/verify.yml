@@ -147,14 +147,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -f tb.v ]; then
-            python3 - <<'EOF' > ../sim.json
-import json, time
-print(json.dumps({
-  "agent":"sim","pass":False,"diagnostics":[],"suggestedFixes":[],
-  "artifacts":[],"metrics":{},"durationMs":0,
-  "skipped":True,"skipReason":"no testbench supplied"
-}))
-EOF
+            printf '%s\n' '{"agent":"sim","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"no testbench supplied"}' > ../sim.json
             exit 0
           fi
           rtl=$(ls *.v | grep -v '^tb\.v$')
@@ -182,14 +175,7 @@ EOF
           # Reuse tb.v as the corner stimulus when present — the chat-side
           # examples are already shaped to probe boundary cases.
           if [ ! -f tb.v ]; then
-            python3 - <<'EOF' > ../corner.json
-import json
-print(json.dumps({
-  "agent":"corner","pass":False,"diagnostics":[],"suggestedFixes":[],
-  "artifacts":[],"metrics":{},"durationMs":0,
-  "skipped":True,"skipReason":"no testbench supplied; corner agent has no stimulus"
-}))
-EOF
+            printf '%s\n' '{"agent":"corner","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"no testbench supplied; corner agent has no stimulus"}' > ../corner.json
             exit 0
           fi
           rtl=$(ls *.v | grep -v '^tb\.v$')
@@ -215,14 +201,7 @@ EOF
         run: |
           set -euo pipefail
           if [ ! -f tb.v ]; then
-            python3 - <<'EOF' > ../coverage.json
-import json
-print(json.dumps({
-  "agent":"coverage","pass":False,"diagnostics":[],"suggestedFixes":[],
-  "artifacts":[],"metrics":{},"durationMs":0,
-  "skipped":True,"skipReason":"no testbench supplied; coverage requires stimulus"
-}))
-EOF
+            printf '%s\n' '{"agent":"coverage","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"no testbench supplied; coverage requires stimulus"}' > ../coverage.json
             exit 0
           fi
           rtl=$(ls *.v | grep -v '^tb\.v$')
@@ -270,15 +249,7 @@ EOF
           docker pull openroad/opensta:latest >/dev/null
           netlist=$(find synth -name "${TOP}.v" -o -name "${TOP}_netlist.v" | head -n1 || true)
           if [ -z "$netlist" ]; then
-            python3 - <<'EOF' > sta.json
-import json, os
-print(json.dumps({
-  "agent":"sta","pass":False,"diagnostics":[],"suggestedFixes":[],
-  "artifacts":[],"metrics":{},"durationMs":0,
-  "skipped":True,
-  "skipReason":"no synthesized netlist available (synthesis_run_id missing or artifact not produced)"
-}))
-EOF
+            printf '%s\n' '{"agent":"sta","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"no synthesized netlist available (synthesis_run_id missing or artifact not produced)"}' > sta.json
             exit 0
           fi
           # The PDK liberty paths follow the OpenROAD container's layout.
@@ -287,16 +258,16 @@ EOF
             gf180mcu)  lib="/PDK/gf180mcuC/libs.ref/gf180mcu_fd_sc_mcu7t5v0/lib/gf180mcu_fd_sc_mcu7t5v0__tt_025C_5v00.lib" ;;
             *)         lib="" ;;
           esac
-          cat > sta.tcl <<TCL
-read_liberty $lib
-read_verilog $netlist
-link_design $TOP
-create_clock -name clk -period 10 [get_ports clk]
-report_checks -path_delay max -format full_clock_expanded
-report_checks -path_delay min
-report_check_types -violators
-exit
-TCL
+          {
+            echo "read_liberty $lib"
+            echo "read_verilog $netlist"
+            echo "link_design $TOP"
+            echo "create_clock -name clk -period 10 [get_ports clk]"
+            echo "report_checks -path_delay max -format full_clock_expanded"
+            echo "report_checks -path_delay min"
+            echo "report_check_types -violators"
+            echo "exit"
+          } > sta.tcl
           set +e
           docker run --rm -v "$PWD:/work" -w /work openroad/opensta:latest sta -no_init sta.tcl > sta.log 2>&1
           sta_ec=$?
