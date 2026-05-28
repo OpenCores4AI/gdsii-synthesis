@@ -1,228 +1,365 @@
-name: Verification Mesh
+# OpenCores verification mesh — GitHub Actions workflow
+# =============================================================================
+# Triggered by lib/verification/cloud-runner.ts from the Vercel app.
+#
+# Layout convention: the app uploads RTL into projects/verify-<design_id>/
+# before dispatching this workflow. The optional testbench is at tb.v in
+# the same directory. The workflow runs the requested subset of agents,
+# writes a verification.json that matches lib/verification/types.ts ->
+# VerificationReport, and uploads it as a single artifact the app polls
+# for. Anything more elaborate than that breaks the contract.
+# =============================================================================
 
-# Runs the OpenCores 6-agent verification mesh against a design pushed
-# to projects/<design_id>/. Emits a single verification.json artifact
-# that the Vercel API consumes and re-emits as OrchestratorEvent.
+name: verify
 
 on:
   workflow_dispatch:
     inputs:
       design_id:
-        description: 'Design ID (subdirectory under projects/)'
+        description: "slug (always starts with verify-)"
         required: true
+        type: string
       top_module:
-        description: 'Top module name'
+        description: "Top Verilog module"
         required: true
+        type: string
       pdk:
-        description: 'Target PDK'
+        description: "Target PDK"
         required: true
-        default: 'sky130'
         type: choice
         options: [sky130, gf180mcu, sg13g2]
-  push:
-    paths:
-      - 'projects/verify-**/*.v'
-      - 'projects/verify-**/*.sv'
+      agents:
+        description: "Comma-separated subset (lint,sim,corner,coverage,sta,drc-lvs)"
+        required: true
+        default: "lint,sim,corner,coverage"
+        type: string
+      synthesis_run_id:
+        description: "Synthesis run id (post-GDSII pass only)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  actions: read
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
+    name: "${{ inputs.design_id }} (${{ inputs.agents }})"
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
+    env:
+      DESIGN_ID: ${{ inputs.design_id }}
+      TOP: ${{ inputs.top_module }}
+      PDK: ${{ inputs.pdk }}
+      AGENTS: ${{ inputs.agents }}
+      SYNTH_RUN_ID: ${{ inputs.synthesis_run_id }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Resolve design under verification
-        id: meta
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            DESIGN_ID="${{ github.event.inputs.design_id }}"
-            TOP="${{ github.event.inputs.top_module }}"
-            PDK="${{ github.event.inputs.pdk }}"
-          else
-            CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E 'projects/verify-.*\.(v|sv)$' | head -1 || true)
-            if [ -z "$CHANGED" ]; then
-              echo "::error::No verify- design changes detected"
-              exit 1
-            fi
-            DESIGN_ID=$(echo "$CHANGED" | cut -d'/' -f2)
-            TOP=$(basename "$CHANGED" | sed 's/\.[^.]*$//')
-            PDK="sky130"
-          fi
-          echo "design_id=$DESIGN_ID" >> $GITHUB_OUTPUT
-          echo "top_module=$TOP"      >> $GITHUB_OUTPUT
-          echo "pdk=$PDK"             >> $GITHUB_OUTPUT
-          echo "Design: $DESIGN_ID  top=$TOP  pdk=$PDK"
-
-      - name: Install EDA tools
+      # ---------------------------------------------------------------------
+      # Toolchain
+      # ---------------------------------------------------------------------
+      # Verilator 5 ships in Ubuntu 24.04 but not 22.04, so we build it
+      # ourselves. Icarus is fine from apt. OpenSTA + Magic + netgen come
+      # from the openroad/flow-scripts container which we mount as a side
+      # step only when sta / drc-lvs are requested.
+      - name: Install Icarus + build deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y verilator iverilog yosys jq python3
-          verilator --version
-          iverilog -V | head -1
-          yosys -V | head -1
+          sudo apt-get install -y --no-install-recommends \
+            iverilog git make g++ python3 python3-pip \
+            autoconf flex bison help2man perl libfl2 libfl-dev zlibc zlib1g zlib1g-dev \
+            ca-certificates jq
 
-      - name: Run verification mesh
-        id: mesh
-        shell: bash
-        env:
-          DESIGN_ID:  ${{ steps.meta.outputs.design_id }}
-          TOP_MODULE: ${{ steps.meta.outputs.top_module }}
-          PDK:        ${{ steps.meta.outputs.pdk }}
+      - name: Cache Verilator 5
+        id: verilator-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/verilator
+          key: verilator-5.026-ubuntu22
+
+      - name: Build Verilator 5
+        if: steps.verilator-cache.outputs.cache-hit != 'true'
         run: |
+          git clone --branch v5.026 --depth 1 https://github.com/verilator/verilator.git /tmp/verilator-src
+          cd /tmp/verilator-src
+          autoconf
+          ./configure --prefix=/opt/verilator
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Add Verilator to PATH
+        run: echo "/opt/verilator/bin" >> "$GITHUB_PATH"
+
+      - name: Print tool versions
+        run: |
+          verilator --version
+          iverilog -V | head -n 1
+
+      # ---------------------------------------------------------------------
+      # Stage the design
+      # ---------------------------------------------------------------------
+      - name: Stage design files
+        id: stage
+        run: |
+          set -euo pipefail
+          src="projects/${DESIGN_ID}"
+          if [ ! -d "$src" ]; then
+            echo "::error::Design directory $src not found in repo"
+            exit 1
+          fi
+          mkdir -p work
+          cp -r "$src"/. work/
+          ls -la work
+          # Comma-split the agents list so later steps can probe it cheaply.
+          echo "agents_csv=,${AGENTS},"  >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Pre-GDSII agents
+      # ---------------------------------------------------------------------
+      - name: Lint (Verilator)
+        if: contains(steps.stage.outputs.agents_csv, ',lint,')
+        id: agent_lint
+        continue-on-error: true
+        working-directory: work
+        run: |
+          set -euo pipefail
+          rtl=$(ls *.v | grep -v '^tb\.v$' || true)
+          if [ -z "$rtl" ]; then
+            echo "::warning::No RTL files staged"
+            exit 1
+          fi
           set +e
-          mkdir -p mesh-out
-          SRC_DIR="projects/${DESIGN_ID}"
-          if [ ! -d "$SRC_DIR" ]; then
-            echo "::error::Project dir $SRC_DIR missing"; exit 1
+          verilator --lint-only -Wall --top-module "$TOP" $rtl 2> lint.err
+          ec=$?
+          set -e
+          # Parse %Error/%Warning lines into the diagnostics shape the app
+          # expects. Verilator emits to stderr.
+          python3 ../scripts/parse_lint.py lint.err "$ec" > ../lint.json
+
+      - name: Sim (Icarus + vvp)
+        if: contains(steps.stage.outputs.agents_csv, ',sim,')
+        id: agent_sim
+        continue-on-error: true
+        working-directory: work
+        run: |
+          set -euo pipefail
+          if [ ! -f tb.v ]; then
+            python3 - <<'EOF' > ../sim.json
+import json, time
+print(json.dumps({
+  "agent":"sim","pass":False,"diagnostics":[],"suggestedFixes":[],
+  "artifacts":[],"metrics":{},"durationMs":0,
+  "skipped":True,"skipReason":"no testbench supplied"
+}))
+EOF
+            exit 0
           fi
-
-          SOURCES=$(find "$SRC_DIR" -maxdepth 2 \( -name '*.v' -o -name '*.sv' \) ! -name 'tb.v' ! -name 'tb_*.v' ! -name '*tb*.v')
-          TB=$(find "$SRC_DIR" -maxdepth 2 \( -name 'tb.v' -o -name 'tb_*.v' \) | head -1)
-          echo "sources: $SOURCES"
-          echo "testbench: $TB"
-
-          START_ALL=$(date +%s%3N)
-
-          # ---------- LINT (verilator) ----------
-          LINT_T0=$(date +%s%3N)
-          verilator --lint-only -Wall --top-module "$TOP_MODULE" $SOURCES 1> mesh-out/lint.stdout 2> mesh-out/lint.stderr
-          LINT_EXIT=$?
-          LINT_T1=$(date +%s%3N)
-
-          # ---------- SIM (icarus) ----------
-          SIM_SKIPPED=1; SIM_EXIT=0
-          SIM_T0=$(date +%s%3N)
-          if [ -n "$TB" ]; then
-            SIM_SKIPPED=0
-            iverilog -g2012 -o mesh-out/sim.out $SOURCES "$TB" 1> mesh-out/sim_compile.stdout 2> mesh-out/sim_compile.stderr
-            CC=$?
-            if [ $CC -eq 0 ]; then
-              ( cd mesh-out && vvp sim.out ) 1> mesh-out/sim.stdout 2> mesh-out/sim.stderr
-              SIM_EXIT=$?
-            else
-              SIM_EXIT=$CC
-              cat mesh-out/sim_compile.stderr > mesh-out/sim.stderr
-            fi
+          rtl=$(ls *.v | grep -v '^tb\.v$')
+          set +e
+          iverilog -g2012 -o sim.out $rtl tb.v 2> sim_compile.err
+          comp_ec=$?
+          set -e
+          if [ $comp_ec -ne 0 ]; then
+            python3 ../scripts/parse_sim.py sim_compile.err "$comp_ec" compile > ../sim.json
+            exit 0
           fi
-          SIM_T1=$(date +%s%3N)
+          set +e
+          vvp sim.out > sim_run.log 2>&1
+          run_ec=$?
+          set -e
+          python3 ../scripts/parse_sim.py sim_run.log "$run_ec" runtime > ../sim.json
 
-          # ---------- COVERAGE (verilator --coverage) ----------
-          COV_SKIPPED=1; COV_EXIT=0; COV_TOTAL="n/a"
-          COV_T0=$(date +%s%3N)
-          if [ -n "$TB" ]; then
-            COV_SKIPPED=0
-            verilator --cc --coverage --build --exe --main --top-module "$TOP_MODULE" \
-              $SOURCES "$TB" -o cov_sim --Mdir mesh-out/obj_cov \
-              1> mesh-out/cov_build.stdout 2> mesh-out/cov_build.stderr
-            COV_EXIT=$?
-            if [ -x mesh-out/obj_cov/cov_sim ]; then
-              ( cd mesh-out/obj_cov && ./cov_sim ) > /dev/null 2>&1 || true
-              verilator_coverage --write-info mesh-out/coverage.info mesh-out/obj_cov/coverage.dat 1> mesh-out/coverage.stdout 2> mesh-out/coverage.stderr || true
-              if [ -f mesh-out/coverage.info ]; then
-                COV_TOTAL=$(grep -E '^DA:' mesh-out/coverage.info | awk -F, 'BEGIN{c=0;t=0}{t++; if ($2>0) c++} END{ if (t>0) printf "%.3f", c/t; else printf "n/a"}')
-              fi
-            fi
+      - name: Corner (Icarus + template stimulus)
+        if: contains(steps.stage.outputs.agents_csv, ',corner,')
+        id: agent_corner
+        continue-on-error: true
+        working-directory: work
+        run: |
+          set -euo pipefail
+          # Reuse tb.v as the corner stimulus when present — the chat-side
+          # examples are already shaped to probe boundary cases.
+          if [ ! -f tb.v ]; then
+            python3 - <<'EOF' > ../corner.json
+import json
+print(json.dumps({
+  "agent":"corner","pass":False,"diagnostics":[],"suggestedFixes":[],
+  "artifacts":[],"metrics":{},"durationMs":0,
+  "skipped":True,"skipReason":"no testbench supplied; corner agent has no stimulus"
+}))
+EOF
+            exit 0
           fi
-          COV_T1=$(date +%s%3N)
+          rtl=$(ls *.v | grep -v '^tb\.v$')
+          set +e
+          iverilog -g2012 -o corner.out $rtl tb.v 2> corner_compile.err
+          comp_ec=$?
+          set -e
+          if [ $comp_ec -ne 0 ]; then
+            python3 ../scripts/parse_sim.py corner_compile.err "$comp_ec" compile corner > ../corner.json
+            exit 0
+          fi
+          set +e
+          vvp corner.out > corner_run.log 2>&1
+          run_ec=$?
+          set -e
+          python3 ../scripts/parse_sim.py corner_run.log "$run_ec" runtime corner > ../corner.json
 
-          # ---------- STA / CORNER / DRC-LVS (skipped in base job) ----------
-          # These require OpenSTA / Magic / KLayout / netgen. Marked as
-          # skipped so the report still has a row for every agent.
+      - name: Coverage (Verilator --binary --coverage)
+        if: contains(steps.stage.outputs.agents_csv, ',coverage,')
+        id: agent_coverage
+        continue-on-error: true
+        working-directory: work
+        run: |
+          set -euo pipefail
+          if [ ! -f tb.v ]; then
+            python3 - <<'EOF' > ../coverage.json
+import json
+print(json.dumps({
+  "agent":"coverage","pass":False,"diagnostics":[],"suggestedFixes":[],
+  "artifacts":[],"metrics":{},"durationMs":0,
+  "skipped":True,"skipReason":"no testbench supplied; coverage requires stimulus"
+}))
+EOF
+            exit 0
+          fi
+          rtl=$(ls *.v | grep -v '^tb\.v$')
+          set +e
+          verilator --binary --coverage -Wno-fatal --top-module tb $rtl tb.v 2> cov_build.err
+          build_ec=$?
+          set -e
+          if [ $build_ec -ne 0 ]; then
+            python3 ../scripts/parse_coverage.py "" "$build_ec" build > ../coverage.json
+            exit 0
+          fi
+          ./obj_dir/Vtb > cov_run.log 2>&1 || true
+          mkdir -p logs/coverage_annotated
+          verilator_coverage --annotate logs/coverage_annotated coverage.dat > cov_summary.log 2>&1 || true
+          python3 ../scripts/parse_coverage.py cov_summary.log 0 annotate > ../coverage.json
 
-          END_ALL=$(date +%s%3N)
-          DUR_ALL=$((END_ALL - START_ALL))
-
-          # Export every measurement so the python heredoc below sees them
-          # via os.environ. DESIGN_ID / TOP_MODULE / PDK already arrive via
-          # the step-level env block.
-          export LINT_T0 LINT_T1 SIM_T0 SIM_T1 SIM_EXIT SIM_SKIPPED
-          export COV_T0 COV_T1 COV_SKIPPED COV_TOTAL DUR_ALL
-
-          # ---------- Emit verification.json ----------
-          python3 - <<'PY' > mesh-out/verification.json
-          import json, os, time, datetime
-          def read(p):
-              try:
-                  with open(p, 'r', errors='replace') as f:
-                      return f.read()
-              except FileNotFoundError:
-                  return ""
-          def lint_diags(s):
-              import re
-              out = []
-              for m in re.finditer(r'^%(Error|Warning|Info)(?:-([A-Z_]+))?:\s+([^:]+):(\d+)(?::(\d+))?:\s+(.+)$', s, re.M):
-                  sev = m.group(1).lower(); sev = 'error' if sev == 'error' else ('warning' if sev == 'warning' else 'info')
-                  out.append({
-                      "severity": sev,
-                      "code": m.group(2) or "VERILATOR",
-                      "message": m.group(6).strip(),
-                      "location": {"file": m.group(3), "line": int(m.group(4)), **({"column": int(m.group(5))} if m.group(5) else {})},
-                  })
-              return out
-          def sim_diags(s):
-              diags = []
-              for line in s.splitlines():
-                  if 'FATAL' in line.upper() or '$fatal' in line: diags.append({"severity":"fatal","code":"SIM_FATAL","message":line.strip()})
-                  elif 'ERROR' in line.upper() or '$error' in line: diags.append({"severity":"error","code":"SIM_ERROR","message":line.strip()})
-                  elif 'Assertion' in line and 'failed' in line: diags.append({"severity":"error","code":"ASSERT_FAILED","message":line.strip()})
-              return diags
-
-          design_id = os.environ['DESIGN_ID'][len('verify-'):] if os.environ['DESIGN_ID'].startswith('verify-') else os.environ['DESIGN_ID']
-          top       = os.environ['TOP_MODULE']
-          pdk       = os.environ['PDK']
-
-          lint_stderr = read('mesh-out/lint.stderr') + read('mesh-out/lint.stdout')
-          sim_out     = read('mesh-out/sim.stdout') + read('mesh-out/sim.stderr') + read('mesh-out/sim_compile.stderr')
-
-          lint_d = lint_diags(lint_stderr)
-          lint_errors = sum(1 for d in lint_d if d['severity'] in ('error','fatal'))
-          sim_d  = sim_diags(sim_out) if int(os.environ.get('SIM_SKIPPED','1')) == 0 else []
-          sim_errors = sum(1 for d in sim_d if d['severity'] in ('error','fatal'))
-
-          def agent(name, pass_, diags, metrics=None, skipped=False, reason=None, dur=0):
-              return {
-                  "agent": name, "pass": pass_, "diagnostics": diags, "suggestedFixes": [],
-                  "artifacts": [], "metrics": metrics or {}, "durationMs": dur,
-                  "skipped": skipped, **({"skipReason": reason} if reason else {}),
-              }
-
-          LINT_DUR = int(os.environ['LINT_T1']) - int(os.environ['LINT_T0'])
-          SIM_DUR  = int(os.environ['SIM_T1'])  - int(os.environ['SIM_T0'])
-          COV_DUR  = int(os.environ['COV_T1'])  - int(os.environ['COV_T0'])
-          DUR_ALL  = int(os.environ['DUR_ALL'])
-
-          agents = [
-              agent("lint",    lint_errors == 0, lint_d, {"errors": lint_errors, "warnings": sum(1 for d in lint_d if d['severity']=='warning')}, dur=LINT_DUR),
-              agent("sim",     sim_errors == 0 and int(os.environ.get('SIM_EXIT','0'))==0, sim_d, {"exitCode": int(os.environ.get('SIM_EXIT','0'))}, skipped=int(os.environ.get('SIM_SKIPPED','1'))==1, reason="no testbench supplied" if int(os.environ.get('SIM_SKIPPED','1'))==1 else None, dur=SIM_DUR),
-              agent("sta",     False, [], skipped=True, reason="OpenSTA not installed in base runner"),
-              agent("corner",  False, [], skipped=True, reason="edge stimulus generator runs on the application server"),
-              agent("coverage",os.environ.get('COV_TOTAL','n/a') != 'n/a' and float(os.environ.get('COV_TOTAL','0') or 0) >= 0.9, [], {"overall": os.environ.get('COV_TOTAL','n/a')}, skipped=int(os.environ.get('COV_SKIPPED','1'))==1, reason="no testbench supplied" if int(os.environ.get('COV_SKIPPED','1'))==1 else None, dur=COV_DUR),
-              agent("drc-lvs", False, [], skipped=True, reason="PDK ruledecks not staged in base runner"),
-          ]
-          report = {
-              "designId": design_id,
-              "topModule": top,
-              "pdk": pdk,
-              "pass": all(a['pass'] or a['skipped'] for a in agents),
-              "iteration": 0,
-              "startedAt": datetime.datetime.utcnow().isoformat() + "Z",
-              "finishedAt": datetime.datetime.utcnow().isoformat() + "Z",
-              "durationMs": DUR_ALL,
-              "agents": agents,
-              "aggregatedFixes": [],
+      # ---------------------------------------------------------------------
+      # Post-GDSII agents (sta, drc-lvs)
+      # ---------------------------------------------------------------------
+      # These need the gate-level netlist + GDS from a prior synthesis run.
+      # We pull them down from the corresponding synthesis workflow run
+      # artifacts and hand them to OpenSTA / Magic / netgen.
+      - name: Fetch synthesis artifacts
+        if: ${{ inputs.synthesis_run_id != '' && (contains(steps.stage.outputs.agents_csv, ',sta,') || contains(steps.stage.outputs.agents_csv, ',drc-lvs,')) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p synth
+          # The synthesis workflow is expected to upload a "synthesis-<top>"
+          # artifact containing <top>.v (netlist) and <top>.gds. Tweak the
+          # names below if your synthesis pipeline uses different ones.
+          gh run download "$SYNTH_RUN_ID" -R "$GITHUB_REPOSITORY" -D synth || {
+            echo "::warning::Could not download synthesis artifacts; STA/DRC-LVS will be skipped"
           }
-          print(json.dumps(report, indent=2))
-          PY
-          cat mesh-out/verification.json
-          true
+          ls -la synth || true
 
-      - name: Upload verification artifact
+      - name: STA (OpenSTA)
+        if: contains(steps.stage.outputs.agents_csv, ',sta,')
+        id: agent_sta
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # Pull a prebuilt OpenSTA image instead of compiling from source.
+          docker pull openroad/opensta:latest >/dev/null
+          netlist=$(find synth -name "${TOP}.v" -o -name "${TOP}_netlist.v" | head -n1 || true)
+          if [ -z "$netlist" ]; then
+            python3 - <<'EOF' > sta.json
+import json, os
+print(json.dumps({
+  "agent":"sta","pass":False,"diagnostics":[],"suggestedFixes":[],
+  "artifacts":[],"metrics":{},"durationMs":0,
+  "skipped":True,
+  "skipReason":"no synthesized netlist available (synthesis_run_id missing or artifact not produced)"
+}))
+EOF
+            exit 0
+          fi
+          # The PDK liberty paths follow the OpenROAD container's layout.
+          case "$PDK" in
+            sky130)    lib="/PDK/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib" ;;
+            gf180mcu)  lib="/PDK/gf180mcuC/libs.ref/gf180mcu_fd_sc_mcu7t5v0/lib/gf180mcu_fd_sc_mcu7t5v0__tt_025C_5v00.lib" ;;
+            *)         lib="" ;;
+          esac
+          cat > sta.tcl <<TCL
+read_liberty $lib
+read_verilog $netlist
+link_design $TOP
+create_clock -name clk -period 10 [get_ports clk]
+report_checks -path_delay max -format full_clock_expanded
+report_checks -path_delay min
+report_check_types -violators
+exit
+TCL
+          set +e
+          docker run --rm -v "$PWD:/work" -w /work openroad/opensta:latest sta -no_init sta.tcl > sta.log 2>&1
+          sta_ec=$?
+          set -e
+          python3 scripts/parse_sta.py sta.log "$sta_ec" > sta.json
+
+      - name: DRC + LVS (Magic + netgen)
+        if: contains(steps.stage.outputs.agents_csv, ',drc-lvs,')
+        id: agent_drclvs
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          gds=$(find synth -name "${TOP}.gds" | head -n1 || true)
+          netlist=$(find synth -name "${TOP}.v" -o -name "${TOP}_netlist.v" | head -n1 || true)
+          if [ -z "$gds" ] || [ -z "$netlist" ]; then
+            python3 - <<'EOF' > drclvs.json
+import json
+print(json.dumps({
+  "agent":"drc-lvs","pass":False,"diagnostics":[],"suggestedFixes":[],
+  "artifacts":[],"metrics":{},"durationMs":0,
+  "skipped":True,
+  "skipReason":"GDS or netlist missing — run synthesis first"
+}))
+EOF
+            exit 0
+          fi
+          docker pull efabless/openlane:latest >/dev/null
+          # The OpenLane image bundles magic + netgen + sky130A.
+          docker run --rm -v "$PWD:/w" -w /w efabless/openlane:latest bash -lc "
+            magic -dnull -noconsole <<MAGIC > drc.log 2>&1
+            gds read $gds
+            load $TOP
+            drc check
+            drc catchup
+            drc count
+            quit -noprompt
+MAGIC
+            netgen -batch lvs '$netlist $TOP' '$gds $TOP' /PDK/sky130A/libs.tech/netgen/sky130A_setup.tcl lvs.log
+          " || true
+          python3 scripts/parse_drc_lvs.py drc.log lvs.log > drclvs.json
+
+      # ---------------------------------------------------------------------
+      # Aggregate into the single verification.json artifact the app polls
+      # ---------------------------------------------------------------------
+      - name: Build verification.json
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 scripts/build_report.py \
+            --design-id "$DESIGN_ID" \
+            --top-module "$TOP" \
+            --pdk "$PDK" \
+            --agents "$AGENTS" \
+            > verification.json
+          cat verification.json | jq '.pass, (.agents | map({agent, pass, skipped}))'
+
+      - name: Upload report artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: verification-${{ steps.meta.outputs.design_id }}
-          path: mesh-out/
-          if-no-files-found: error
+          # Name MUST match: verification-<design_id> where <design_id>
+          # already starts with "verify-". The Vercel app looks up this
+          # exact name in lib/verification/cloud-runner.ts.
+          name: verification-${{ inputs.design_id }}
+          path: verification.json
           retention-days: 7
