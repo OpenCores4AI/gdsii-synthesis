@@ -263,11 +263,22 @@ jobs:
           set -euo pipefail
           # Pull a prebuilt OpenSTA image instead of compiling from source.
           docker pull openroad/opensta:latest >/dev/null
-          netlist=$(find synth -name "${TOP}.v" -o -name "${TOP}_netlist.v" | head -n1 || true)
+          # Synthesis pipelines name the netlist differently (top.v,
+          # top_netlist.v, *_synth.v, runs/.../final.v). Be permissive:
+          # prefer exact-top, fall back to anything that looks like a
+          # gate-level netlist.
+          netlist=$(find synth -type f \
+            \( -name "${TOP}.v" -o -name "${TOP}_netlist.v" \
+            -o -name "${TOP}_synth.v" -o -name "final.v" \
+            -o -name "*netlist*.v" \) 2>/dev/null | head -n1 || true)
+          if [ -z "$netlist" ]; then
+            netlist=$(find synth -type f -name "*.v" 2>/dev/null | head -n1 || true)
+          fi
           if [ -z "$netlist" ]; then
             printf '%s\n' '{"agent":"sta","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"no synthesized netlist available (synthesis_run_id missing or artifact not produced)"}' > sta.json
             exit 0
           fi
+          echo "Using netlist: $netlist"
           # The PDK liberty paths follow the OpenROAD container's layout.
           case "$PDK" in
             sky130)    lib="/PDK/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib" ;;
@@ -296,12 +307,21 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          gds=$(find synth -name "${TOP}.gds" | head -n1 || true)
-          netlist=$(find synth -name "${TOP}.v" -o -name "${TOP}_netlist.v" | head -n1 || true)
+          # Same permissive search as STA — synthesis flows name files
+          # inconsistently. Grab any .gds and any plausible netlist.
+          gds=$(find synth -type f -name "*.gds" 2>/dev/null | head -n1 || true)
+          netlist=$(find synth -type f \
+            \( -name "${TOP}.v" -o -name "${TOP}_netlist.v" \
+            -o -name "${TOP}_synth.v" -o -name "final.v" \
+            -o -name "*netlist*.v" \) 2>/dev/null | head -n1 || true)
+          if [ -z "$netlist" ]; then
+            netlist=$(find synth -type f -name "*.v" 2>/dev/null | head -n1 || true)
+          fi
           if [ -z "$gds" ] || [ -z "$netlist" ]; then
             printf '%s\n' '{"agent":"drc-lvs","pass":false,"diagnostics":[],"suggestedFixes":[],"artifacts":[],"metrics":{},"durationMs":0,"skipped":true,"skipReason":"GDS or netlist missing — run synthesis first"}' > drclvs.json
             exit 0
           fi
+          echo "Using GDS: $gds and netlist: $netlist"
           docker pull efabless/openlane:latest >/dev/null
           # Build the magic script first so the inner heredoc doesn't have
           # to live inside the YAML block scalar (column-0 lines would
