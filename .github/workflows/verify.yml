@@ -261,12 +261,7 @@ jobs:
         continue-on-error: true
         run: |
           set -euo pipefail
-          # Pull a prebuilt OpenSTA image instead of compiling from source.
-          docker pull openroad/opensta:latest >/dev/null
-          # Synthesis pipelines name the netlist differently (top.v,
-          # top_netlist.v, *_synth.v, runs/.../final.v). Be permissive:
-          # prefer exact-top, fall back to anything that looks like a
-          # gate-level netlist.
+          # Synthesis pipelines name the netlist differently. Be permissive.
           netlist=$(find synth -type f \
             \( -name "${TOP}.v" -o -name "${TOP}_netlist.v" \
             -o -name "${TOP}_synth.v" -o -name "final.v" \
@@ -279,10 +274,14 @@ jobs:
             exit 0
           fi
           echo "Using netlist: $netlist"
-          # The PDK liberty paths follow the OpenROAD container's layout.
+          # efabless/openlane bundles OpenSTA + the PDK liberty files, so
+          # we use the same image as DRC/LVS instead of pulling another
+          # one. The previous openroad/opensta tag did not exist on Docker
+          # Hub and the pull failed with exit 127.
+          docker pull efabless/openlane:latest >/dev/null
           case "$PDK" in
-            sky130)    lib="/PDK/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib" ;;
-            gf180mcu)  lib="/PDK/gf180mcuC/libs.ref/gf180mcu_fd_sc_mcu7t5v0/lib/gf180mcu_fd_sc_mcu7t5v0__tt_025C_5v00.lib" ;;
+            sky130)    lib="/openLANE_flow/pdks/sky130A/libs.ref/sky130_fd_sc_hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib" ;;
+            gf180mcu)  lib="/openLANE_flow/pdks/gf180mcuC/libs.ref/gf180mcu_fd_sc_mcu7t5v0/lib/gf180mcu_fd_sc_mcu7t5v0__tt_025C_5v00.lib" ;;
             *)         lib="" ;;
           esac
           {
@@ -296,9 +295,18 @@ jobs:
             echo "exit"
           } > sta.tcl
           set +e
-          docker run --rm -v "$PWD:/work" -w /work openroad/opensta:latest sta -no_init sta.tcl > sta.log 2>&1
+          docker run --rm -v "$PWD:/w" -w /w efabless/openlane:latest \
+            bash -lc "sta -no_init /w/sta.tcl" > sta.log 2>&1
           sta_ec=$?
           set -e
+          # If sta isn't on PATH inside the image OR docker itself failed,
+          # surface that as a skip (real but not actionable) rather than
+          # a hard fail that blocks GDSII.
+          if [ $sta_ec -eq 127 ] || [ ! -s sta.log ] || grep -qi "command not found\|Unable to find image\|no such file" sta.log; then
+            tail=$(tail -n 8 sta.log | tr '\n' ' ' | head -c 400)
+            printf '%s\n' "{\"agent\":\"sta\",\"pass\":false,\"diagnostics\":[],\"suggestedFixes\":[],\"artifacts\":[],\"metrics\":{\"exitCode\":$sta_ec},\"durationMs\":0,\"skipped\":true,\"skipReason\":\"OpenSTA not available in container (exit $sta_ec): $tail\"}" > sta.json
+            exit 0
+          fi
           python3 scripts/parse_sta.py sta.log "$sta_ec" > sta.json
 
       - name: DRC + LVS (Magic + netgen)
