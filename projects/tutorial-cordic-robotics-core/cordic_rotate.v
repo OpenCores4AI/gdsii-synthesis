@@ -2,15 +2,15 @@ module cordic_rotate #(
   parameter WIDTH = 16,
   parameter ITERS = 15
 ) (
-  input  wire                     clk,
-  input  wire                     rst,
-  input  wire                     start,
-  input  wire signed [WIDTH-1:0]  x_in,
-  input  wire signed [WIDTH-1:0]  y_in,
-  input  wire signed [WIDTH-1:0]  angle,
-  output reg  signed [WIDTH-1:0]  x_out,
-  output reg  signed [WIDTH-1:0]  y_out,
-  output reg                      valid
+  input  wire                clk,
+  input  wire                rst,
+  input  wire                start,
+  input  wire [WIDTH-1:0]    x_in,
+  input  wire [WIDTH-1:0]    y_in,
+  input  wire [WIDTH-1:0]    angle,
+  output reg  [WIDTH-1:0]    x_out,
+  output reg  [WIDTH-1:0]    y_out,
+  output reg                 valid
 );
   function signed [WIDTH-1:0] atan_lut(input [4:0] i);
     case (i)
@@ -48,7 +48,7 @@ module cordic_rotate #(
     end else begin
       valid <= 1'b0;
       if (start && !busy) begin
-        x <= x_in; y <= y_in; z <= angle;
+        x <= $signed(x_in); y <= $signed(y_in); z <= $signed(angle);
         i <= 5'd0; busy <= 1'b1;
       end else if (busy) begin
         if (dir_neg) begin
