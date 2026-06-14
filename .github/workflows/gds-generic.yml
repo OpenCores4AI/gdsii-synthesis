@@ -5,8 +5,11 @@ name: Generate GDSII (generic)
 # (via FP_PIN_ORDER_CFG), so the design keeps its own custom pinout. Isolated
 # from gds.yml — it cannot affect the TinyTapeout flow.
 #
-# Reads:  projects/<project_id>/<module>.v   and   projects/<project_id>/pin_order.cfg
-# Emits:  artifact gdsii-generic-<module> with the .gds + a layout render.
+# OpenLane runs via `docker run` (not a container job) so the runner's JS
+# actions (checkout/upload-artifact) keep working with host Node.
+#
+# Reads:  projects/<project_id>/<module>.v  and  projects/<project_id>/pin_order.cfg
+# Emits:  artifact gdsii-generic-<module> with the .gds (+ render if available).
 
 on:
   workflow_dispatch:
@@ -18,14 +21,13 @@ on:
         description: 'Top module name'
         required: true
       clock_port:
-        description: 'Clock port name (empty for purely combinational designs)'
+        description: 'Clock port name (empty for combinational designs)'
         required: false
         default: 'clk'
 
 jobs:
   gds:
     runs-on: ubuntu-24.04
-    container: ghcr.io/efabless/openlane2:2.3.10
     timeout-minutes: 45
     steps:
       - name: Checkout repository
@@ -44,7 +46,6 @@ jobs:
           cp "$SRC" design/src/
           if [ -f "$PINCFG" ]; then cp "$PINCFG" design/pin_order.cfg; else echo "" > design/pin_order.cfg; fi
 
-          # Build config.json. Include CLOCK_PORT only when the design is clocked.
           python3 - "$MOD" "$CLK" <<'PYEOF'
           import json, sys
           mod, clk = sys.argv[1], sys.argv[2]
@@ -59,36 +60,34 @@ jobs:
             "QUIT_ON_SYNTH_CHECKS": False,
             "RUN_KLAYOUT_XOR": False,
             "RUN_MAGIC_DRC": False,
+            "CLOCK_PERIOD": 20.0,
           }
           if clk.strip():
             cfg["CLOCK_PORT"] = clk.strip()
-            cfg["CLOCK_PERIOD"] = 20.0
           else:
             cfg["CLOCK_PORT"] = ""
-            cfg["CLOCK_PERIOD"] = 20.0
           json.dump(cfg, open("design/config.json", "w"), indent=2)
           print(open("design/config.json").read())
-          print("---- pin_order.cfg ----")
-          print(open("design/pin_order.cfg").read())
+          print("---- pin_order.cfg ----"); print(open("design/pin_order.cfg").read())
           PYEOF
 
-      - name: Run OpenLane
+      - name: Run OpenLane (docker)
         run: |
-          cd design
-          openlane --log-level INFO config.json
+          docker run --rm -v "$PWD/design":/work -w /work \
+            ghcr.io/efabless/openlane2:2.3.10 \
+            openlane --log-level INFO config.json
+          sudo chmod -R a+rX design || true
 
       - name: Collect outputs
         run: |
           MOD="${{ github.event.inputs.module_name }}"
           mkdir -p out
-          # Newest run dir.
           RUN=$(ls -dt design/runs/*/ | head -1)
           echo "run dir: $RUN"
-          GDS=$(find "$RUN/final/gds" -name '*.gds' | head -1 || true)
-          if [ -z "$GDS" ]; then echo "::error::no GDS produced"; ls -R "$RUN/final" || true; exit 1; fi
+          GDS=$(find "$RUN/final/gds" -name '*.gds' 2>/dev/null | head -1 || true)
+          if [ -z "$GDS" ]; then echo "::error::no GDS produced"; find "$RUN/final" -maxdepth 2 -type d || true; exit 1; fi
           cp "$GDS" "out/${MOD}.gds"
-          # Render a PNG of the layout with KLayout (bundled in the image), best-effort.
-          PNG=$(find "$RUN/final" -name '*.png' | head -1 || true)
+          PNG=$(find "$RUN/final" -name '*.png' 2>/dev/null | head -1 || true)
           if [ -n "$PNG" ]; then cp "$PNG" "out/${MOD}.png"; fi
           ls -la out
 
