@@ -1,0 +1,106 @@
+name: FPGA Portability Report
+
+# Isolated, ADDITIVE workflow. It never touches the GDSII flow (gds.yml), so it
+# cannot break tape-out. It runs the SAME RTL through yosys synth_xilinx to
+# prove FPGA-synthesizability and report real resource utilization, plus a
+# logic-depth measurement (ltp) that feeds the logical/electrical-effort
+# analysis surfaced in the app.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Project ID from OpenCores.ai'
+        required: true
+      module_name:
+        description: 'Top module name'
+        required: true
+      family:
+        description: 'Xilinx family for synth_xilinx'
+        required: false
+        default: 'xc7'
+
+jobs:
+  fpga:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup OSS CAD Suite (yosys)
+        uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: Resolve source file
+        id: src
+        run: |
+          PROJECT_ID="${{ github.event.inputs.project_id }}"
+          MODULE_NAME="${{ github.event.inputs.module_name }}"
+          SRC="projects/${PROJECT_ID}/${MODULE_NAME}.v"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::File not found: $SRC"
+            exit 1
+          fi
+          echo "src=$SRC" >> $GITHUB_OUTPUT
+          echo "module=$MODULE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Run FPGA synthesis (yosys synth_xilinx)
+        run: |
+          FAMILY="${{ github.event.inputs.family }}"
+          FAMILY="${FAMILY:-xc7}"
+          SRC="${{ steps.src.outputs.src }}"
+          MODULE="${{ steps.src.outputs.module }}"
+          mkdir -p fpga_out
+          # Flattened synth for a clean whole-design utilization, then ltp for
+          # the longest topological path (real logic depth).
+          yosys -p "read_verilog $SRC; synth_xilinx -family $FAMILY -flatten -top $MODULE; tee -o fpga_out/stat.txt stat; tee -o fpga_out/ltp.txt ltp -noff" 2>&1 | tee fpga_out/yosys.log
+
+      - name: Parse utilization + logic depth into JSON
+        run: |
+          MODULE="${{ steps.src.outputs.module }}"
+          FAMILY="${{ github.event.inputs.family }}"
+          FAMILY="${FAMILY:-xc7}"
+          python3 << 'PYEOF'
+          import re, json, os
+          module = os.environ.get('MODULE') or "${{ steps.src.outputs.module }}"
+          family = os.environ.get('FAMILY') or "${{ github.event.inputs.family }}" or "xc7"
+          stat = open('fpga_out/stat.txt').read()
+          ltp = open('fpga_out/ltp.txt').read()
+
+          def sum_cells(text, pred):
+              total = 0
+              for m in re.finditer(r'^\s*(\d+)\s+([A-Za-z][A-Za-z0-9_]*)\s*$', text, re.M):
+                  if pred(m.group(2)):
+                      total += int(m.group(1))
+              return total
+
+          luts  = sum_cells(stat, lambda c: re.match(r'LUT[1-6]$', c))
+          ffs   = sum_cells(stat, lambda c: re.match(r'FD[A-Z]*E?$', c))
+          carry = sum_cells(stat, lambda c: re.match(r'CARRY\d+$', c))
+          dsp   = sum_cells(stat, lambda c: re.match(r'DSP', c))
+          bram  = sum_cells(stat, lambda c: re.match(r'RAMB', c))
+          lcs_m = re.findall(r'Estimated number of LCs:\s*(\d+)', stat)
+          lcs   = int(lcs_m[-1]) if lcs_m else luts
+          depth_m = re.search(r'longest topological path.*\(length=(\d+)\)', ltp)
+          depth = int(depth_m.group(1)) if depth_m else None
+
+          report = {
+            "ok": True,
+            "module": module,
+            "part": f"Xilinx 7-series ({family})",
+            "tool": "yosys synth_xilinx -flatten",
+            "luts": luts, "ffs": ffs, "carry": carry, "dsp": dsp, "bram": bram,
+            "estimatedLcs": lcs,
+            "logicDepth": depth,
+          }
+          with open('fpga_out/fpga_report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          print(json.dumps(report, indent=2))
+          PYEOF
+
+      - name: Upload FPGA report
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpga-${{ steps.src.outputs.module }}
+          path: fpga_out/
+          retention-days: 30
