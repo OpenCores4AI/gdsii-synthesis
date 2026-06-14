@@ -24,6 +24,10 @@ on:
         description: 'Clock port name (empty for combinational designs)'
         required: false
         default: 'clk'
+      die_um:
+        description: 'Square die size in microns (absolute floorplan; keeps small designs large enough for the PDN)'
+        required: false
+        default: '100'
 
 jobs:
   gds:
@@ -46,16 +50,19 @@ jobs:
           cp "$SRC" design/src/
           if [ -f "$PINCFG" ]; then cp "$PINCFG" design/pin_order.cfg; else echo "" > design/pin_order.cfg; fi
 
-          python3 - "$MOD" "$CLK" <<'PYEOF'
+          python3 - "$MOD" "$CLK" "${{ github.event.inputs.die_um }}" <<'PYEOF'
           import json, sys
           mod, clk = sys.argv[1], sys.argv[2]
+          die = float(sys.argv[3] or "100")
           cfg = {
             "DESIGN_NAME": mod,
             "VERILOG_FILES": ["dir::src/*.v"],
             "FP_PIN_ORDER_CFG": "dir::pin_order.cfg",
-            "FP_SIZING": "relative",
-            "FP_CORE_UTIL": 40,
-            "PL_TARGET_DENSITY_PCT": 55,
+            # Absolute floorplan so tiny educational designs stay large enough
+            # for the power-distribution network (avoids PDN-0185).
+            "FP_SIZING": "absolute",
+            "DIE_AREA": [0, 0, die, die],
+            "PL_TARGET_DENSITY_PCT": 35,
             "PDK": "sky130A",
             "QUIT_ON_SYNTH_CHECKS": False,
             "RUN_KLAYOUT_XOR": False,
