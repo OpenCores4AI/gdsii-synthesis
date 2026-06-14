@@ -1,0 +1,100 @@
+name: Generate GDSII (generic)
+
+# Standalone-macro flow (NO TinyTapeout harness). Hardens the user's module
+# directly with OpenLane and places the I/O pins on the sides the user chose
+# (via FP_PIN_ORDER_CFG), so the design keeps its own custom pinout. Isolated
+# from gds.yml — it cannot affect the TinyTapeout flow.
+#
+# Reads:  projects/<project_id>/<module>.v   and   projects/<project_id>/pin_order.cfg
+# Emits:  artifact gdsii-generic-<module> with the .gds + a layout render.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Project ID'
+        required: true
+      module_name:
+        description: 'Top module name'
+        required: true
+      clock_port:
+        description: 'Clock port name (empty for purely combinational designs)'
+        required: false
+        default: 'clk'
+
+jobs:
+  gds:
+    runs-on: ubuntu-24.04
+    container: ghcr.io/efabless/openlane2:latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Assemble OpenLane design
+        run: |
+          PID="${{ github.event.inputs.project_id }}"
+          MOD="${{ github.event.inputs.module_name }}"
+          CLK="${{ github.event.inputs.clock_port }}"
+          SRC="projects/${PID}/${MOD}.v"
+          PINCFG="projects/${PID}/pin_order.cfg"
+          test -f "$SRC" || { echo "::error::missing $SRC"; exit 1; }
+
+          mkdir -p design/src
+          cp "$SRC" design/src/
+          if [ -f "$PINCFG" ]; then cp "$PINCFG" design/pin_order.cfg; else echo "" > design/pin_order.cfg; fi
+
+          # Build config.json. Include CLOCK_PORT only when the design is clocked.
+          python3 - "$MOD" "$CLK" <<'PYEOF'
+          import json, sys
+          mod, clk = sys.argv[1], sys.argv[2]
+          cfg = {
+            "DESIGN_NAME": mod,
+            "VERILOG_FILES": ["dir::src/*.v"],
+            "FP_PIN_ORDER_CFG": "dir::pin_order.cfg",
+            "FP_SIZING": "relative",
+            "FP_CORE_UTIL": 40,
+            "PL_TARGET_DENSITY_PCT": 55,
+            "PDK": "sky130A",
+            "QUIT_ON_SYNTH_CHECKS": False,
+            "RUN_KLAYOUT_XOR": False,
+            "RUN_MAGIC_DRC": False,
+          }
+          if clk.strip():
+            cfg["CLOCK_PORT"] = clk.strip()
+            cfg["CLOCK_PERIOD"] = 20.0
+          else:
+            cfg["CLOCK_PORT"] = ""
+            cfg["CLOCK_PERIOD"] = 20.0
+          json.dump(cfg, open("design/config.json", "w"), indent=2)
+          print(open("design/config.json").read())
+          print("---- pin_order.cfg ----")
+          print(open("design/pin_order.cfg").read())
+          PYEOF
+
+      - name: Run OpenLane
+        run: |
+          cd design
+          openlane --log-level INFO config.json
+
+      - name: Collect outputs
+        run: |
+          MOD="${{ github.event.inputs.module_name }}"
+          mkdir -p out
+          # Newest run dir.
+          RUN=$(ls -dt design/runs/*/ | head -1)
+          echo "run dir: $RUN"
+          GDS=$(find "$RUN/final/gds" -name '*.gds' | head -1 || true)
+          if [ -z "$GDS" ]; then echo "::error::no GDS produced"; ls -R "$RUN/final" || true; exit 1; fi
+          cp "$GDS" "out/${MOD}.gds"
+          # Render a PNG of the layout with KLayout (bundled in the image), best-effort.
+          PNG=$(find "$RUN/final" -name '*.png' | head -1 || true)
+          if [ -n "$PNG" ]; then cp "$PNG" "out/${MOD}.png"; fi
+          ls -la out
+
+      - name: Upload GDSII
+        uses: actions/upload-artifact@v4
+        with:
+          name: gdsii-generic-${{ github.event.inputs.module_name }}
+          path: out/
+          retention-days: 30
