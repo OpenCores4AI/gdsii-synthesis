@@ -80,10 +80,23 @@ jobs:
 
       - name: Run OpenLane (docker)
         run: |
-          docker run --rm -v "$PWD/design":/work -w /work \
-            ghcr.io/efabless/openlane2:2.3.10 \
-            openlane --log-level INFO config.json
+          # The OpenLane2 image resolves/downloads the PDK on first run; that
+          # HTTP fetch occasionally flakes. Retry the whole flow a few times.
+          attempt=0
+          until [ $attempt -ge 3 ]; do
+            attempt=$((attempt+1))
+            echo "::group::OpenLane attempt $attempt"
+            if docker run --rm -v "$PWD/design":/work -w /work \
+                 ghcr.io/efabless/openlane2:2.3.10 \
+                 openlane --log-level INFO config.json; then
+              echo "::endgroup::"; echo "OpenLane succeeded on attempt $attempt"; break
+            fi
+            echo "::endgroup::"; echo "attempt $attempt failed; retrying…"; sleep 10
+          done
           sudo chmod -R a+rX design || true
+          # Verify a GDS exists; if not, fail.
+          RUN=$(ls -dt design/runs/*/ 2>/dev/null | head -1 || true)
+          test -n "$RUN" && find "$RUN/final/gds" -name '*.gds' | head -1 | grep -q . || { echo "::error::OpenLane produced no GDS after retries"; exit 1; }
 
       - name: Collect outputs
         run: |
