@@ -78,22 +78,36 @@ jobs:
           print("---- pin_order.cfg ----"); print(open("design/pin_order.cfg").read())
           PYEOF
 
+      # Cache the sky130 PDK across runs so production never depends on the
+      # flaky upstream PDK download. Once one run populates it, every later run
+      # reads it from cache (no network) — the durable fix for the Vercel+GitHub
+      # production setup.
+      - name: Cache sky130 PDK
+        uses: actions/cache@v4
+        with:
+          path: .pdk
+          key: pdk-sky130A-openlane2-2.3.10-v1
+
       - name: Run OpenLane (docker)
         run: |
-          # The OpenLane2 image resolves/downloads the PDK on first run; that
-          # HTTP fetch occasionally flakes. Retry the whole flow a few times.
+          mkdir -p .pdk
+          # PDK_ROOT points at the cached volume; OpenLane/ciel reuses it.
+          # Retry the OpenLane step to ride out a transient first-time fetch.
           attempt=0
           until [ $attempt -ge 3 ]; do
             attempt=$((attempt+1))
             echo "::group::OpenLane attempt $attempt"
-            if docker run --rm -v "$PWD/design":/work -w /work \
+            if docker run --rm \
+                 -e PDK_ROOT=/pdk \
+                 -v "$PWD/.pdk":/pdk \
+                 -v "$PWD/design":/work -w /work \
                  ghcr.io/efabless/openlane2:2.3.10 \
                  openlane --log-level INFO config.json; then
               echo "::endgroup::"; echo "OpenLane succeeded on attempt $attempt"; break
             fi
-            echo "::endgroup::"; echo "attempt $attempt failed; retrying…"; sleep 10
+            echo "::endgroup::"; echo "attempt $attempt failed; retrying…"; sleep 15
           done
-          sudo chmod -R a+rX design || true
+          sudo chmod -R a+rX design .pdk || true
           # Verify a GDS exists; if not, fail.
           RUN=$(ls -dt design/runs/*/ 2>/dev/null | head -1 || true)
           test -n "$RUN" && find "$RUN/final/gds" -name '*.gds' | head -1 | grep -q . || { echo "::error::OpenLane produced no GDS after retries"; exit 1; }
