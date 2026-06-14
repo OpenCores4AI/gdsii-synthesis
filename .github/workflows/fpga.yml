@@ -66,6 +66,7 @@ jobs:
           family = os.environ.get('FAMILY') or "${{ github.event.inputs.family }}" or "xc7"
           stat = open('fpga_out/stat.txt').read()
           ltp = open('fpga_out/ltp.txt').read()
+          full = open('fpga_out/yosys.log').read()
 
           def sum_cells(text, pred):
               total = 0
@@ -79,9 +80,9 @@ jobs:
           carry = sum_cells(stat, lambda c: re.match(r'CARRY\d+$', c))
           dsp   = sum_cells(stat, lambda c: re.match(r'DSP', c))
           bram  = sum_cells(stat, lambda c: re.match(r'RAMB', c))
-          lcs_m = re.findall(r'Estimated number of LCs:\s*(\d+)', stat)
+          lcs_m = re.findall(r'Estimated number of LCs:\s*(\d+)', full)
           lcs   = int(lcs_m[-1]) if lcs_m else luts
-          depth_m = re.search(r'longest topological path.*\(length=(\d+)\)', ltp)
+          depth_m = re.search(r'longest topological path.*\(length=(\d+)\)', ltp + '\n' + full, re.IGNORECASE)
           depth = int(depth_m.group(1)) if depth_m else None
 
           report = {
