@@ -13,6 +13,14 @@ on:
       name:
         description: 'Design label (used for the artifact name)'
         required: true
+      mode:
+        description: 'real (130nm) or micron (scaled for manual fab)'
+        required: false
+        default: 'real'
+      min_feature_um:
+        description: 'Target min feature in microns (micron mode)'
+        required: false
+        default: '10'
 
 jobs:
   masks:
@@ -37,7 +45,7 @@ jobs:
 
       - name: Extract per-layer masks
         run: |
-          python3 extract_masks.py design.gds masks_out
+          python3 extract_masks.py design.gds masks_out "${{ github.event.inputs.mode }}" "${{ github.event.inputs.min_feature_um }}"
 
       - name: Upload masks
         uses: actions/upload-artifact@v4
