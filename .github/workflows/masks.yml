@@ -1,0 +1,47 @@
+name: Layer Mask Export
+
+# Isolated, ADDITIVE workflow. Downloads a generated GDSII and extracts
+# per-layer photolithography masks (dark-field + clear-field PNG + vector SVG)
+# with KLayout-free tooling (gdstk + matplotlib). Never touches the GDSII flow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gds_url:
+        description: 'Public URL of the .gds file'
+        required: true
+      name:
+        description: 'Design label (used for the artifact name)'
+        required: true
+
+jobs:
+  masks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tooling
+        run: pip install gdstk matplotlib
+
+      - name: Download GDSII
+        run: |
+          curl -fsSL "${{ github.event.inputs.gds_url }}" -o design.gds
+          ls -la design.gds
+
+      - name: Extract per-layer masks
+        run: |
+          python3 extract_masks.py design.gds masks_out
+
+      - name: Upload masks
+        uses: actions/upload-artifact@v4
+        with:
+          name: masks-${{ github.event.inputs.name }}
+          path: masks_out/
+          retention-days: 30
