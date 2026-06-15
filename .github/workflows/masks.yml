@@ -47,6 +47,10 @@ jobs:
         run: |
           python3 extract_masks.py design.gds masks_out "${{ github.event.inputs.mode }}" "${{ github.event.inputs.min_feature_um }}"
 
+      - name: Flatten to layers.json (for the in-app 3D viewer)
+        run: |
+          python3 gds_to_json.py design.gds masks_out/layers.json 4000 || true
+
       - name: Upload masks
         uses: actions/upload-artifact@v4
         with:
