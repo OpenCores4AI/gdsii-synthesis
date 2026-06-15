@@ -44,13 +44,20 @@ jobs:
           mod = sys.argv[1]
           stat = open('out/stat.txt').read()
           ltp = open('out/ltp.txt').read() + open('out/yosys.log').read()
-          # Total cells (last "Number of cells:" in the top block).
-          cells_m = re.findall(r'Number of cells:\s*(\d+)', stat)
-          cells = int(cells_m[-1]) if cells_m else 0
-          # Flip-flops: sum cell lines whose type looks like a DFF/latch.
+          # Use only the last "=== <mod> ===" block to avoid double counting.
+          idx = stat.rfind('=== ')
+          region = stat[idx:] if idx >= 0 else stat
+          # Total cells = sum of every cell-type count line (generic cells are
+          # $_AND_, $_DFF_, …). Flip-flops = the DFF/latch subset.
+          cells = 0
           ffs = 0
-          for m in re.finditer(r'^\s*(\d+)\s+(\$_?[A-Za-z0-9_]*(?:DFF|DLATCH|SDFF|ADFF)[A-Za-z0-9_]*)\s*$', stat, re.M):
-              ffs += int(m.group(1))
+          for m in re.finditer(r'^\s*(\d+)\s+(\$[A-Za-z0-9_]+)\s*$', region, re.M):
+              n = int(m.group(1)); cells += n
+              if re.search(r'DFF|DLATCH|SDFF|ADFF', m.group(2)):
+                  ffs += n
+          if cells == 0:
+              cm = re.findall(r'Number of cells:\s*(\d+)', stat)
+              cells = int(cm[-1]) if cm else 0
           depth_m = re.search(r'longest topological path.*\(length=(\d+)\)', ltp, re.I)
           depth = int(depth_m.group(1)) if depth_m else 0
           json.dump({"topModule": mod, "cells": cells, "ffs": ffs, "logicDepth": depth},
