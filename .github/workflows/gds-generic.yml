@@ -54,6 +54,21 @@ jobs:
           import json, sys
           mod, clk = sys.argv[1], sys.argv[2]
           die = float(sys.argv[3] or "100")
+          # Grow the die so the big square bond pads (≈70um) fit around the
+          # perimeter: count pins per side from pin_order.cfg and reserve room.
+          SECT = {"#N", "#E", "#S", "#W"}
+          per = {"#N": 0, "#E": 0, "#S": 0, "#W": 0}
+          cur = None
+          try:
+            for raw in open("design/pin_order.cfg"):
+              l = raw.strip()
+              if l in SECT: cur = l
+              elif l and cur: per[cur] += 1
+          except OSError:
+            pass
+          max_side = max(per.values()) if per else 0
+          pad_min = max_side * 120.0 + 160.0  # ~70um pad + 50um gap + margins
+          die = max(die, pad_min, 120.0)
           cfg = {
             "DESIGN_NAME": mod,
             "VERILOG_FILES": ["dir::src/*.v"],
@@ -112,17 +127,16 @@ jobs:
           RUN=$(ls -dt design/runs/*/ 2>/dev/null | head -1 || true)
           test -n "$RUN" && find "$RUN/final/gds" -name '*.gds' | head -1 | grep -q . || { echo "::error::OpenLane produced no GDS after retries"; exit 1; }
 
-      - name: Collect outputs
+      - name: Stamp square bond pads
         run: |
           MOD="${{ github.event.inputs.module_name }}"
           mkdir -p out
           RUN=$(ls -dt design/runs/*/ | head -1)
-          echo "run dir: $RUN"
           GDS=$(find "$RUN/final/gds" -name '*.gds' 2>/dev/null | head -1 || true)
           if [ -z "$GDS" ]; then echo "::error::no GDS produced"; find "$RUN/final" -maxdepth 2 -type d || true; exit 1; fi
-          cp "$GDS" "out/${MOD}.gds"
-          PNG=$(find "$RUN/final" -name '*.png' 2>/dev/null | head -1 || true)
-          if [ -n "$PNG" ]; then cp "$PNG" "out/${MOD}.png"; fi
+          pip install --quiet gdstk
+          # Add wire-bondable square pads per the chosen pinout sides.
+          python3 stamp_pads.py "$GDS" "out/${MOD}.gds" design/pin_order.cfg 70 || cp "$GDS" "out/${MOD}.gds"
           ls -la out
 
       - name: Upload GDSII
