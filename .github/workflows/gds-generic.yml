@@ -103,6 +103,24 @@ jobs:
           path: .pdk
           key: pdk-sky130A-openlane2-2.3.10-v1
 
+      # Maximum-robustness PDK source under our control: if the cache is empty,
+      # restore the PDK from a vendored GitHub Release asset (this repo). Only
+      # falls through to OpenLane's upstream download if neither exists.
+      - name: Restore vendored PDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .pdk
+          if [ -z "$(ls -A .pdk 2>/dev/null)" ]; then
+            if gh release download pdk-vendor -R ${{ github.repository }} -p sky130-pdk.tar.zst -O pdk.tar.zst 2>/dev/null; then
+              tar -C .pdk -I zstd -xf pdk.tar.zst && echo "PDK restored from vendored release"
+            else
+              echo "no vendored PDK release yet — OpenLane will resolve it once, then we vendor it"
+            fi
+          else
+            echo "PDK present from cache"
+          fi
+
       - name: Run OpenLane (docker)
         run: |
           mkdir -p .pdk
@@ -123,6 +141,27 @@ jobs:
             echo "::endgroup::"; echo "attempt $attempt failed; retrying…"; sleep 15
           done
           sudo chmod -R a+rX design .pdk || true
+
+      # Vendor the resolved PDK to a GitHub Release (once) so future runs — and
+      # production — never depend on the flaky upstream PDK download again.
+      - name: Vendor PDK to release (once)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [ -z "$(ls -A .pdk 2>/dev/null)" ]; then echo "no PDK to vendor"; exit 0; fi
+          if ! gh release view pdk-vendor -R ${{ github.repository }} >/dev/null 2>&1; then
+            gh release create pdk-vendor -R ${{ github.repository }} -t "Vendored sky130 PDK (OpenLane2 2.3.10)" -n "Cached PDK for reproducible, network-independent OpenLane runs." || true
+          fi
+          HAS=$(gh release view pdk-vendor -R ${{ github.repository }} --json assets -q '.assets[].name' 2>/dev/null | grep -c 'sky130-pdk.tar.zst' || true)
+          if [ "$HAS" = "0" ]; then
+            echo "vendoring PDK to release…"
+            tar -C .pdk -I 'zstd -19 -T0' -cf sky130-pdk.tar.zst .
+            gh release upload pdk-vendor -R ${{ github.repository }} sky130-pdk.tar.zst || true
+            echo "PDK vendored ($(du -h sky130-pdk.tar.zst | cut -f1))"
+          else
+            echo "PDK already vendored"
+          fi
           # Verify a GDS exists; if not, fail.
           RUN=$(ls -dt design/runs/*/ 2>/dev/null | head -1 || true)
           test -n "$RUN" && find "$RUN/final/gds" -name '*.gds' | head -1 | grep -q . || { echo "::error::OpenLane produced no GDS after retries"; exit 1; }
