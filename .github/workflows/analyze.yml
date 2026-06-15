@@ -1,0 +1,66 @@
+name: Circuit Quality Analysis
+
+# Fast, PDK-free structural analysis of the RTL with yosys, run after the
+# verifiers pass and before GDSII. Emits the raw numbers (cell count, flop
+# count, longest combinational path) that the app turns into the circuit-quality
+# report (logical/electrical effort, estimated parasitics, fmax, area, power).
+# Isolated and additive — never touches the GDSII flow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Project ID'
+        required: true
+      module_name:
+        description: 'Top module name'
+        required: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup OSS CAD Suite (yosys)
+        uses: YosysHQ/setup-oss-cad-suite@v3
+
+      - name: Synthesize + measure
+        run: |
+          PID="${{ github.event.inputs.project_id }}"
+          MOD="${{ github.event.inputs.module_name }}"
+          SRC="projects/${PID}/${MOD}.v"
+          test -f "$SRC" || { echo "::error::missing $SRC"; exit 1; }
+          mkdir -p out
+          yosys -p "read_verilog $SRC; synth -top $MOD -flatten; tee -o out/stat.txt stat; tee -o out/ltp.txt ltp -noff" 2>&1 | tee out/yosys.log || true
+
+      - name: Parse to analysis.json
+        run: |
+          MOD="${{ github.event.inputs.module_name }}"
+          python3 - "$MOD" <<'PYEOF'
+          import re, json, sys
+          mod = sys.argv[1]
+          stat = open('out/stat.txt').read()
+          ltp = open('out/ltp.txt').read() + open('out/yosys.log').read()
+          # Total cells (last "Number of cells:" in the top block).
+          cells_m = re.findall(r'Number of cells:\s*(\d+)', stat)
+          cells = int(cells_m[-1]) if cells_m else 0
+          # Flip-flops: sum cell lines whose type looks like a DFF/latch.
+          ffs = 0
+          for m in re.finditer(r'^\s*(\d+)\s+(\$_?[A-Za-z0-9_]*(?:DFF|DLATCH|SDFF|ADFF)[A-Za-z0-9_]*)\s*$', stat, re.M):
+              ffs += int(m.group(1))
+          depth_m = re.search(r'longest topological path.*\(length=(\d+)\)', ltp, re.I)
+          depth = int(depth_m.group(1)) if depth_m else 0
+          json.dump({"topModule": mod, "cells": cells, "ffs": ffs, "logicDepth": depth},
+                    open('out/analysis.json', 'w'), indent=2)
+          print(open('out/analysis.json').read())
+          PYEOF
+
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: analyze-${{ github.event.inputs.module_name }}
+          path: out/analysis.json
+          retention-days: 30
